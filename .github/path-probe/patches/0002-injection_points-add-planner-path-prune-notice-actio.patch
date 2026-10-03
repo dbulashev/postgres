@@ -1,0 +1,465 @@
+From cd6a755224f46d6cbd948e5177c609fc2205c584 Mon Sep 17 00:00:00 2001
+From: r2d2 <r2d2@localhost>
+Date: Tue, 8 Sep 2026 17:03:03 +0000
+Subject: [PATCH 2/2] injection_points: add planner path-prune notice action
+
+Add a test action for the planner path-pruning injection points.  It emits
+one NOTICE line per event using simple key=value fields: path type, index
+oid where one applies, costs, row estimate, pathkeys and required_outer for
+both the new path and the one responsible for the decision.
+
+The existing "notice" action treats the injection point argument as a
+string, so attaching it to a point that passes a typed payload prints
+garbage; this action understands the payload instead.
+
+Two details are worth noting.  Upper relations have no relids, so they are
+reported as "upper" rather than as an empty set that would look like a
+relation.  A bitmap heap path is attributed to the index of its bitmap
+qual, because otherwise a displacement between two paths over the same
+physical index appears to involve no index at all; only the simple
+single-index case is handled, and BitmapAnd or BitmapOr paths are reported
+as having no index.
+
+The row estimate is included because it is what most clearly separates two
+candidates over the same index: an unparameterized path over a large table
+and a parameterized one differ by orders of magnitude in rows while sharing
+the same index oid.
+
+The accompanying TAP test asserts structural facts only: that each kind of
+event can be observed, that a parameterized candidate is reported with a
+non-empty required_outer, and that an index path is reported with its
+index.  It deliberately does not compare the output as a whole, because the
+lines contain costs and row estimates that are not stable across platforms
+or planner changes.  It attaches the points in a single statement, so that
+the planning of the attach statements themselves is not observed.
+
+This is a test helper, not a planner reporting API.
+---
+ src/test/modules/injection_points/Makefile    |   2 +
+ .../injection_points/injection_points.c       | 220 ++++++++++++++++++
+ src/test/modules/injection_points/meson.build |   5 +
+ .../t/001_planner_path_prune.pl               | 128 ++++++++++
+ 4 files changed, 355 insertions(+)
+ create mode 100644 src/test/modules/injection_points/t/001_planner_path_prune.pl
+
+diff --git a/src/test/modules/injection_points/Makefile b/src/test/modules/injection_points/Makefile
+index 9d8b4b3..3ce09bb 100644
+--- a/src/test/modules/injection_points/Makefile
++++ b/src/test/modules/injection_points/Makefile
+@@ -12,6 +12,8 @@ PGFILEDESC = "injection_points - facility for injection points"
+ EXTRA_INSTALL = contrib/test_decoding
+ 
+ REGRESS = injection_points hashagg reindex_conc vacuum
++
++TAP_TESTS = 1
+ REGRESS_OPTS = --dlpath=$(top_builddir)/src/test/regress
+ 
+ ISOLATION = basic \
+diff --git a/src/test/modules/injection_points/injection_points.c b/src/test/modules/injection_points/injection_points.c
+index 66d8158..e24cb5e 100644
+--- a/src/test/modules/injection_points/injection_points.c
++++ b/src/test/modules/injection_points/injection_points.c
+@@ -20,9 +20,12 @@
+ #include "fmgr.h"
+ #include "funcapi.h"
+ #include "injection_points.h"
++#include "lib/stringinfo.h"
+ #include "miscadmin.h"
++#include "nodes/pathnodes.h"
+ #include "nodes/pg_list.h"
+ #include "nodes/value.h"
++#include "optimizer/pathnode.h"
+ #include "storage/dsm_registry.h"
+ #include "storage/ipc.h"
+ #include "storage/lwlock.h"
+@@ -81,6 +84,9 @@ extern PGDLLEXPORT void injection_notice(const char *name,
+ extern PGDLLEXPORT void injection_wait(const char *name,
+ 									   const void *private_data,
+ 									   void *arg);
++extern PGDLLEXPORT void injection_path_prune_notice(const char *name,
++													const void *private_data,
++													void *arg);
+ 
+ /* track if injection points attached in this process are linked to it */
+ static bool injection_point_local = false;
+@@ -222,6 +228,218 @@ injection_notice(const char *name, const void *private_data, void *arg)
+ 		elog(NOTICE, "notice triggered for injection point %s", name);
+ }
+ 
++#ifdef USE_INJECTION_POINTS
++/*
++ * Helpers for the planner path-pruning notice action.
++ */
++static const char *
++path_type_name(const Path *path)
++{
++	if (path == NULL)
++		return "none";
++
++	switch (path->pathtype)
++	{
++		case T_SeqScan:
++			return "SeqScan";
++		case T_IndexScan:
++			return "IndexScan";
++		case T_IndexOnlyScan:
++			return "IndexOnlyScan";
++		case T_BitmapHeapScan:
++			return "BitmapHeapScan";
++		case T_TidScan:
++			return "TidScan";
++		case T_NestLoop:
++			return "NestLoop";
++		case T_MergeJoin:
++			return "MergeJoin";
++		case T_HashJoin:
++			return "HashJoin";
++		case T_Sort:
++			return "Sort";
++		case T_IncrementalSort:
++			return "IncrementalSort";
++		case T_Gather:
++			return "Gather";
++		case T_GatherMerge:
++			return "GatherMerge";
++		case T_Material:
++			return "Material";
++		case T_Memoize:
++			return "Memoize";
++		default:
++			return "Other";
++	}
++}
++
++/*
++ * Describe the relation a path belongs to.  Upper relations have no relids,
++ * so report their kind instead of printing an empty set as if it were one.
++ */
++static char *
++rel_to_cstring(RelOptInfo *rel)
++{
++	StringInfoData buf;
++	int			member = -1;
++	bool		first = true;
++
++	initStringInfo(&buf);
++
++	if (rel->reloptkind == RELOPT_UPPER_REL ||
++		rel->reloptkind == RELOPT_OTHER_UPPER_REL)
++	{
++		appendStringInfoString(&buf, "upper");
++		return buf.data;
++	}
++
++	appendStringInfoChar(&buf, '{');
++	while (rel->relids != NULL &&
++		   (member = bms_next_member(rel->relids, member)) >= 0)
++	{
++		if (!first)
++			appendStringInfoChar(&buf, ',');
++		appendStringInfo(&buf, "%d", member);
++		first = false;
++	}
++	appendStringInfoChar(&buf, '}');
++
++	return buf.data;
++}
++
++static char *
++relids_to_cstring(Relids relids)
++{
++	StringInfoData buf;
++	int			member = -1;
++	bool		first = true;
++
++	initStringInfo(&buf);
++	appendStringInfoChar(&buf, '{');
++	while (relids != NULL && (member = bms_next_member(relids, member)) >= 0)
++	{
++		if (!first)
++			appendStringInfoChar(&buf, ',');
++		appendStringInfo(&buf, "%d", member);
++		first = false;
++	}
++	appendStringInfoChar(&buf, '}');
++
++	return buf.data;
++}
++
++/*
++ * Index behind a path, if any.
++ *
++ * A bitmap heap path is reported by the index of its bitmap qual, because
++ * otherwise a displacement between two paths over the same physical index
++ * looks like a displacement involving no index at all.  Only the simple
++ * single-index case is handled: BitmapAnd and BitmapOr paths combine several
++ * indexes and are reported as having none.
++ */
++static Oid
++path_index_oid(const Path *path)
++{
++	if (path == NULL)
++		return InvalidOid;
++
++	if (IsA(path, IndexPath))
++		return ((const IndexPath *) path)->indexinfo->indexoid;
++
++	if (IsA(path, BitmapHeapPath))
++		return path_index_oid(((const BitmapHeapPath *) path)->bitmapqual);
++
++	return InvalidOid;
++}
++#endif
++
++/*
++ * injection_path_prune_notice
++ *
++ * Report one planner path-pruning event as a single NOTICE line.  This is a
++ * test helper, not a planner reporting API.
++ */
++void
++injection_path_prune_notice(const char *name,
++							const void *private_data,
++							void *arg)
++{
++#ifdef USE_INJECTION_POINTS
++	const InjectionPointCondition *condition = private_data;
++
++	Assert(arg != NULL);
++
++	if (!injection_point_allowed(condition, NULL))
++		return;
++
++	if (strcmp(name, "planner-add-path-precheck-reject") == 0)
++	{
++		PlannerPathPrecheckInjectionData *data = arg;
++		char	   *rel = rel_to_cstring(data->parent_rel);
++		char	   *required_outer = relids_to_cstring(data->required_outer);
++
++		elog(NOTICE,
++			 "PLANNER_PATH event=precheck-reject rel=%s "
++			 "startup=%.2f total=%.2f disabled=%d pathkeys=%d "
++			 "required_outer=%s "
++			 "old_type=%s old_index=%u old_startup=%.2f old_total=%.2f "
++			 "old_rows=%.0f",
++			 rel, data->startup_cost, data->total_cost,
++			 data->disabled_nodes, list_length(data->pathkeys),
++			 required_outer,
++			 path_type_name(data->old_path),
++			 path_index_oid(data->old_path),
++			 data->old_path->startup_cost, data->old_path->total_cost,
++			 data->old_path->rows);
++		pfree(rel);
++		pfree(required_outer);
++	}
++	else
++	{
++		PlannerPathComparisonInjectionData *data = arg;
++		const char *event;
++		char	   *rel;
++		char	   *new_outer;
++		char	   *old_outer;
++
++		if (strcmp(name, "planner-add-path-accept") == 0)
++			event = "accept";
++		else if (strcmp(name, "planner-add-path-reject") == 0)
++			event = "reject";
++		else
++			event = "displace";
++
++		rel = rel_to_cstring(data->parent_rel);
++		new_outer = relids_to_cstring(PATH_REQ_OUTER(data->new_path));
++		old_outer = data->old_path ?
++			relids_to_cstring(PATH_REQ_OUTER(data->old_path)) : pstrdup("none");
++
++		elog(NOTICE,
++			 "PLANNER_PATH event=%s rel=%s "
++			 "new_type=%s new_index=%u new_startup=%.2f new_total=%.2f "
++			 "new_rows=%.0f new_pathkeys=%d new_required_outer=%s "
++			 "old_type=%s old_index=%u old_startup=%.2f old_total=%.2f "
++			 "old_rows=%.0f old_required_outer=%s",
++			 event, rel,
++			 path_type_name(data->new_path), path_index_oid(data->new_path),
++			 data->new_path->startup_cost, data->new_path->total_cost,
++			 data->new_path->rows,
++			 list_length(data->new_path->pathkeys), new_outer,
++			 path_type_name(data->old_path), path_index_oid(data->old_path),
++			 data->old_path ? data->old_path->startup_cost : 0.0,
++			 data->old_path ? data->old_path->total_cost : 0.0,
++			 data->old_path ? data->old_path->rows : 0.0,
++			 old_outer);
++
++		pfree(rel);
++		pfree(new_outer);
++		pfree(old_outer);
++	}
++#else
++	elog(ERROR, "injection points are not supported by this build");
++#endif
++}
++
+ /*
+  * Error cleanup callback for injection point waits.
+  */
+@@ -335,6 +553,8 @@ injection_points_attach(PG_FUNCTION_ARGS)
+ 		function = "injection_notice";
+ 	else if (strcmp(action, "wait") == 0)
+ 		function = "injection_wait";
++	else if (strcmp(action, "path-prune-notice") == 0)
++		function = "injection_path_prune_notice";
+ 	else
+ 		elog(ERROR, "incorrect action \"%s\" for injection point creation", action);
+ 
+diff --git a/src/test/modules/injection_points/meson.build b/src/test/modules/injection_points/meson.build
+index 80a09f3..9b9281d 100644
+--- a/src/test/modules/injection_points/meson.build
++++ b/src/test/modules/injection_points/meson.build
+@@ -41,6 +41,11 @@ tests += {
+     # The injection points are cluster-wide, so disable installcheck
+     'runningcheck': false,
+   },
++  'tap': {
++    'tests': [
++      't/001_planner_path_prune.pl',
++    ],
++  },
+   'isolation': {
+     'specs': [
+       'basic',
+diff --git a/src/test/modules/injection_points/t/001_planner_path_prune.pl b/src/test/modules/injection_points/t/001_planner_path_prune.pl
+new file mode 100644
+index 0000000..d2a2b3c
+--- /dev/null
++++ b/src/test/modules/injection_points/t/001_planner_path_prune.pl
+@@ -0,0 +1,128 @@
++
++# Copyright (c) 2026, PostgreSQL Global Development Group
++
++# Structural test for the planner path-pruning injection points.
++#
++# The NOTICE lines contain costs and row estimates, which are not stable
++# across platforms or planner changes, so this test does not compare the
++# output as a whole.  It asserts only the facts the instrumentation exists
++# for: that each kind of event can be observed, and that a parameterized
++# candidate is reported with a non-empty required_outer.
++
++use strict;
++use warnings FATAL => 'all';
++
++use PostgreSQL::Test::Cluster;
++use PostgreSQL::Test::Utils;
++use Test::More;
++
++if ($ENV{enable_injection_points} ne 'yes')
++{
++	plan skip_all => 'Injection points not supported by this build';
++}
++
++my $node = PostgreSQL::Test::Cluster->new('main');
++$node->init;
++$node->start;
++
++$node->safe_psql('postgres', 'CREATE EXTENSION injection_points;');
++
++my $setup = q{
++CREATE TABLE ppc (id int PRIMARY KEY);
++CREATE TABLE ppo (id int PRIMARY KEY, customer_id int NOT NULL);
++INSERT INTO ppc SELECT g FROM generate_series(1, 200) g;
++INSERT INTO ppo SELECT g, 1 + (g % 200) FROM generate_series(1, 20000) g;
++CREATE INDEX ppo_customer_idx ON ppo (customer_id);
++ANALYZE ppc, ppo;
++};
++$node->safe_psql('postgres', $setup);
++
++# A nested loop over the inner index is the shape that produces a
++# parameterized path.  The settings are here to make that shape reachable,
++# not to bless any particular cost.
++my $query = q{
++SELECT injection_points_set_local();
++-- Attach in a single statement: attaching one by one would mean that the
++-- planning of each subsequent attach statement is itself observed, and the
++-- assertions below could be satisfied by those events rather than by the
++-- query under test.
++SELECT injection_points_attach(name, 'path-prune-notice')
++FROM (VALUES
++    ('planner-add-path-accept'),
++    ('planner-add-path-reject'),
++    ('planner-add-path-displace')
++) AS p(name);
++SET max_parallel_workers_per_gather = 0;
++SET enable_hashjoin = off;
++SET enable_mergejoin = off;
++EXPLAIN (COSTS OFF) SELECT o.id FROM ppc c JOIN ppo o ON o.customer_id = c.id
++ WHERE c.id BETWEEN 1 AND 5;
++};
++
++my ($result, $stdout, $stderr) = $node->psql('postgres', $query);
++is($result, 0, 'query with path pruning points attached succeeds');
++
++like($stderr, qr/PLANNER_PATH event=accept/, 'an accepted path is reported');
++like(
++	$stderr,
++	qr/PLANNER_PATH event=(reject|displace)/,
++	'a pruned path is reported');
++like($stderr, qr/new_required_outer=\{\d+/,
++	'a parameterized candidate is reported with a non-empty required_outer');
++like(
++	$stderr,
++	qr/new_type=IndexScan new_index=[1-9]\d*/,
++	'an index path is reported with its index');
++
++# The precheck boundary reports a candidate that has no Path yet, so its
++# line has a different shape.
++my $precheck = q{
++SELECT injection_points_set_local();
++SELECT injection_points_attach(name, 'path-prune-notice')
++FROM (VALUES ('planner-add-path-precheck-reject')) AS p(name);
++SET max_parallel_workers_per_gather = 0;
++EXPLAIN (COSTS OFF) SELECT o.id FROM ppc c JOIN ppo o ON o.customer_id = c.id
++ JOIN ppc d ON d.id = c.id;
++};
++my ($r2, $out2, $err2) = $node->psql('postgres', $precheck);
++is($r2, 0, 'query with the precheck point attached succeeds');
++like(
++	$err2,
++	qr/PLANNER_PATH event=precheck-reject/,
++	'a precheck rejection is reported');
++
++# add_path() frees a displaced path unless it is an IndexPath, so the
++# displace point is only safe if it fires before that pfree.  An indexed
++# lookup has the seqscan displaced by the indexscan.  Compare what the
++# displace event reports for the old path with what the same path reported
++# when it was accepted: a callback reading freed memory reports garbage or
++# crashes the backend.
++$node->safe_psql(
++	'postgres', q{
++CREATE TABLE ppt (id int, v int);
++INSERT INTO ppt SELECT g, g FROM generate_series(1, 2000) g;
++CREATE INDEX ppt_id_idx ON ppt (id);
++ANALYZE ppt;
++});
++my $displace = q{
++SELECT injection_points_set_local();
++SELECT injection_points_attach(name, 'path-prune-notice')
++FROM (VALUES
++    ('planner-add-path-accept'),
++    ('planner-add-path-displace')
++) AS p(name);
++SET max_parallel_workers_per_gather = 0;
++EXPLAIN (COSTS OFF) SELECT * FROM ppt WHERE id = 42;
++};
++my ($r3, $out3, $err3) = $node->psql('postgres', $displace);
++is($r3, 0, 'query with the displace point attached succeeds');
++my @accepted = $err3 =~
++  /event=accept rel=\{\d+\} new_type=SeqScan new_index=0 new_startup=(\S+) new_total=(\S+) new_rows=(\S+)/;
++my @displaced = $err3 =~
++  /event=displace rel=\{\d+\} new_type=IndexScan .* old_type=SeqScan old_index=0 old_startup=(\S+) old_total=(\S+) old_rows=(\S+)/;
++is(scalar @displaced, 3, 'a seqscan displaced by an indexscan is reported');
++is_deeply(\@displaced, \@accepted,
++	'the displaced seqscan is reported as it was when accepted');
++
++$node->stop;
++done_testing();
+-- 
+2.43.0
+

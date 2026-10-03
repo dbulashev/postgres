@@ -1,0 +1,259 @@
+# Docker image: PostgreSQL from this branch + the planner path-pruning
+# injection point series (.github/path-probe/patches), pushed to Docker Hub
+# as one multi-platform tag (linux/amd64 + linux/arm64, e.g. Apple Silicon).
+#
+# The branch is master plus CI scaffolding commits whose subjects start with
+# "path-probe:".  To rebuild against a newer master: rebase path-probe-image
+# onto master and push.  If the series stops applying, the "Apply patches"
+# step fails and nothing is pushed.
+#
+# Each platform is built on a native runner (compiling PostgreSQL under QEMU
+# takes several times longer), pushed by digest, and the digests are merged
+# into one manifest list at the end.
+#
+# Required repository secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN.
+
+name: path-probe image
+
+on:
+  push:
+    branches: [path-probe-image]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: path-probe-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      base: ${{ steps.v.outputs.base }}
+      base_short: ${{ steps.v.outputs.base_short }}
+      pg: ${{ steps.v.outputs.pg }}
+      major: ${{ steps.v.outputs.major }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 50 # apply-patches.sh looks up the last upstream commit
+      - id: v
+        run: |
+          base=$(.github/path-probe/apply-patches.sh --base-only)
+          pg=$(sed -n 's/^AC_INIT(\[PostgreSQL\], \[\([^]]*\)\].*/\1/p' configure.ac)
+          major=$(echo "$pg" | sed 's/[^0-9].*//')
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "base_short=${base:0:12}" >> "$GITHUB_OUTPUT"
+          echo "pg=$pg" >> "$GITHUB_OUTPUT"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+
+  # Same check the series README asks reviewers to run: build with injection
+  # points and cassert, run the injection_points module tests, including the
+  # TAP test added by 0002.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 50
+
+      - name: Apply patches
+        run: .github/path-probe/apply-patches.sh
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison flex libipc-run-perl libicu-dev libreadline-dev zlib1g-dev
+
+      - name: Build
+        run: |
+          ./configure --enable-injection-points --enable-cassert \
+            --enable-debug --enable-tap-tests
+          make -j"$(nproc)" -s
+
+      - name: Test injection_points module
+        run: make -C src/test/modules/injection_points check PROVE_FLAGS=--timer
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: injection-points-logs-${{ matrix.runner }}
+          path: |
+            src/test/modules/injection_points/log/
+            src/test/modules/injection_points/tmp_check/log/
+            src/test/modules/injection_points/output_iso/
+            src/test/modules/injection_points/regression.diffs
+          if-no-files-found: ignore
+
+  build:
+    needs: [prepare, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/postgres-path-probe
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 50
+
+      - name: Apply patches
+        run: .github/path-probe/apply-patches.sh
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.title=postgres-path-probe
+            org.opencontainers.image.description=PostgreSQL ${{ needs.prepare.outputs.pg }} with planner path-pruning injection points
+            org.postgresql.upstream.revision=${{ needs.prepare.outputs.base }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Build into the local daemon and check it before anything is pushed;
+      # the push below is served from the same cache.
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .github/path-probe/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          tags: path-probe:ci
+          build-args: |
+            PG_MAJOR=${{ needs.prepare.outputs.major }}
+          cache-from: type=gha,scope=path-probe-${{ matrix.arch }}
+          cache-to: type=gha,scope=path-probe-${{ matrix.arch }},mode=max
+
+      # The image is only useful if the patched planner and the
+      # path-prune-notice action are both there: attach the points and
+      # expect at least one accept event from a trivial EXPLAIN.
+      - name: Smoke test
+        run: |
+          docker run -d --name pp -e POSTGRES_PASSWORD=postgres path-probe:ci
+          for _ in $(seq 60); do
+            if docker exec pp pg_isready -U postgres -q; then break; fi
+            sleep 1
+          done
+          docker exec -i pp psql -U postgres -X -v ON_ERROR_STOP=1 >trace.log 2>&1 <<'EOF' || { cat trace.log; docker logs pp; exit 1; }
+          CREATE EXTENSION injection_points;
+          SELECT injection_points_set_local();
+          SELECT injection_points_attach(name, 'path-prune-notice')
+          FROM (VALUES ('planner-add-path-accept'), ('planner-add-path-reject'),
+                       ('planner-add-path-displace'), ('planner-add-path-precheck-reject')) AS p(name);
+          CREATE TABLE t (id int PRIMARY KEY, v int);
+          EXPLAIN SELECT * FROM t WHERE id = 1;
+          EOF
+          cat trace.log
+          if ! grep -q 'PLANNER_PATH.*event=accept' trace.log; then
+            echo "::error::no PLANNER_PATH accept event in the trace (${{ matrix.platform }})"
+            docker logs pp
+            exit 1
+          fi
+          docker rm -f pp >/dev/null
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: path-probe:ci
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Untagged push: the tags are attached to the merged manifest list.
+      - name: Push by digest
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .github/path-probe/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: true
+          sbom: true
+          build-args: |
+            PG_MAJOR=${{ needs.prepare.outputs.major }}
+          cache-from: type=gha,scope=path-probe-${{ matrix.arch }}
+          cache-to: type=gha,scope=path-probe-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest="${{ steps.push.outputs.digest }}"
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/postgres-path-probe
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.pg }}-${{ needs.prepare.outputs.base_short }}
+            type=raw,value=${{ needs.prepare.outputs.pg }}
+            type=raw,value=latest
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect \
+            "$IMAGE:${{ needs.prepare.outputs.pg }}-${{ needs.prepare.outputs.base_short }}"
