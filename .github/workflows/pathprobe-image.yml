@@ -1,0 +1,297 @@
+# Docker image: PostgreSQL from this branch + the pathprobe core hooks patch,
+# with the pathprobe extension installed, pushed to Docker Hub as one
+# multi-platform tag (linux/amd64 + linux/arm64, e.g. Apple Silicon).
+#
+# The branch is master plus CI scaffolding commits whose subjects start with
+# "pathprobe:".  To rebuild against a newer master: rebase pathprobe-image
+# onto master and push.  To take a newer pathprobe: change PATHPROBE_REF
+# below (or pass pathprobe_ref to a manual run).  If the patch stops applying,
+# the "Apply patch" step fails and nothing is pushed.
+#
+# Each platform is built on a native runner (compiling PostgreSQL under QEMU
+# takes several times longer), pushed by digest, and the digests are merged
+# into one manifest list at the end.
+#
+# Required repository secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN.
+
+name: pathprobe image
+
+on:
+  push:
+    branches: [pathprobe-image]
+  workflow_dispatch:
+    inputs:
+      pathprobe_ref:
+        description: pathprobe commit, branch or tag (default PATHPROBE_REF)
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pathprobe-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PATHPROBE_REPO: obartunov/pathprobe
+  # Pinned: the core hooks patch and the extension must come from the same
+  # commit (r2d2/advisor-output-audit, 2026-10-03).  The jobs after prepare
+  # use the resolved sha, so a branch passed to a manual run cannot move
+  # between them.
+  PATHPROBE_REF: ${{ inputs.pathprobe_ref || '32f63f301750a52fcf8125310c0d9b19571d4fe6' }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      base: ${{ steps.v.outputs.base }}
+      base_short: ${{ steps.v.outputs.base_short }}
+      pg: ${{ steps.v.outputs.pg }}
+      major: ${{ steps.v.outputs.major }}
+      pathprobe: ${{ steps.v.outputs.pathprobe }}
+      pathprobe_short: ${{ steps.v.outputs.pathprobe_short }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 50 # apply-patches.sh looks up the last upstream commit
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PATHPROBE_REPO }}
+          ref: ${{ env.PATHPROBE_REF }}
+          path: pathprobe-src
+      - id: v
+        run: |
+          base=$(.github/pathprobe/apply-patches.sh --base-only)
+          pg=$(sed -n 's/^AC_INIT(\[PostgreSQL\], \[\([^]]*\)\].*/\1/p' configure.ac)
+          major=$(echo "$pg" | sed 's/[^0-9].*//')
+          pp=$(git -C pathprobe-src rev-parse HEAD)
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "base_short=${base:0:12}" >> "$GITHUB_OUTPUT"
+          echo "pg=$pg" >> "$GITHUB_OUTPUT"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+          echo "pathprobe=$pp" >> "$GITHUB_OUTPUT"
+          echo "pathprobe_short=${pp:0:7}" >> "$GITHUB_OUTPUT"
+
+  # The check the pathprobe README asks for: a patched server with cassert,
+  # the extension installed into it, and its regression suite (make
+  # installcheck).  The Perl TAP model tests (t/) are not run here.
+  test:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 50
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PATHPROBE_REPO }}
+          ref: ${{ needs.prepare.outputs.pathprobe }}
+          path: pathprobe-src
+
+      - name: Apply patch
+        run: .github/pathprobe/apply-patches.sh pathprobe-src
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison flex libicu-dev libreadline-dev zlib1g-dev
+
+      - name: Build and install PostgreSQL
+        run: |
+          ./configure --prefix="$HOME/pg" --enable-cassert --enable-debug
+          make -j"$(nproc)" -s
+          make -s install
+
+      - name: Build and install pathprobe
+        run: |
+          make -C pathprobe-src PG_CONFIG="$HOME/pg/bin/pg_config"
+          make -C pathprobe-src PG_CONFIG="$HOME/pg/bin/pg_config" install
+
+      - name: Regression tests
+        run: |
+          export PATH="$HOME/pg/bin:$PATH" PGHOST="$RUNNER_TEMP" PGUSER=postgres
+          initdb -D "$RUNNER_TEMP/data" -U postgres >/dev/null
+          pg_ctl -D "$RUNNER_TEMP/data" -l "$RUNNER_TEMP/server.log" \
+            -o "-k $RUNNER_TEMP -c listen_addresses=" -w start
+          make -C pathprobe-src PG_CONFIG="$HOME/pg/bin/pg_config" installcheck
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: pathprobe-logs-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/server.log
+            pathprobe-src/regression.diffs
+            pathprobe-src/results/
+          if-no-files-found: ignore
+
+  build:
+    needs: [prepare, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/postgres-pathprobe
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 50
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PATHPROBE_REPO }}
+          ref: ${{ needs.prepare.outputs.pathprobe }}
+          path: pathprobe-src
+
+      - name: Apply patch
+        run: .github/pathprobe/apply-patches.sh pathprobe-src
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.title=postgres-pathprobe
+            org.opencontainers.image.description=PostgreSQL ${{ needs.prepare.outputs.pg }} with the pathprobe core hooks and extension
+            org.postgresql.upstream.revision=${{ needs.prepare.outputs.base }}
+            io.github.obartunov.pathprobe.revision=${{ needs.prepare.outputs.pathprobe }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Build into the local daemon and check it before anything is pushed;
+      # the push below is served from the same cache.
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .github/pathprobe/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          tags: pathprobe:ci
+          build-args: |
+            PG_MAJOR=${{ needs.prepare.outputs.major }}
+          cache-from: type=gha,scope=pathprobe-${{ matrix.arch }}
+          cache-to: type=gha,scope=pathprobe-${{ matrix.arch }},mode=max
+
+      # A stock server runs the extension too, with reduced coverage, so
+      # check coverage rather than just that the functions exist:
+      # add_path_precheck needs the core hooks patch.  The listen_addresses
+      # check guards the published port.
+      - name: Smoke test
+        run: |
+          docker run -d --name pp -e POSTGRES_PASSWORD=postgres pathprobe:ci
+          for _ in $(seq 60); do
+            if docker exec pp pg_isready -h 127.0.0.1 -U postgres -q; then break; fi
+            sleep 1
+          done
+          docker exec -i pp psql -U postgres -X -v ON_ERROR_STOP=1 -At >smoke.log 2>&1 <<'EOF' || { cat smoke.log; docker logs pp; exit 1; }
+          SHOW listen_addresses;
+          CREATE EXTENSION pathprobe;
+          CREATE TABLE a (id int PRIMARY KEY, v int);
+          CREATE TABLE b (id int PRIMARY KEY, a_id int);
+          INSERT INTO a SELECT g, g FROM generate_series(1, 1000) g;
+          INSERT INTO b SELECT g, g % 1000 + 1 FROM generate_series(1, 10000) g;
+          ANALYZE a, b;
+          SELECT pathprobe_json('SELECT * FROM a JOIN b ON b.a_id = a.id')::jsonb -> 'coverage';
+          EOF
+          cat smoke.log
+          grep -qx '\*' smoke.log || { echo "::error::listen_addresses is not '*'"; exit 1; }
+          if ! grep -q '"add_path_precheck": true' smoke.log; then
+            echo "::error::no add_path_precheck coverage: core hooks missing (${{ matrix.platform }})"
+            docker logs pp
+            exit 1
+          fi
+          docker rm -f pp >/dev/null
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Untagged push: the tags are attached to the merged manifest list.
+      - name: Push by digest
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .github/pathprobe/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: true
+          sbom: true
+          build-args: |
+            PG_MAJOR=${{ needs.prepare.outputs.major }}
+          cache-from: type=gha,scope=pathprobe-${{ matrix.arch }}
+          cache-to: type=gha,scope=pathprobe-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest="${{ steps.push.outputs.digest }}"
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/postgres-pathprobe
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.pg }}-${{ needs.prepare.outputs.base_short }}-pp${{ needs.prepare.outputs.pathprobe_short }}
+            type=raw,value=${{ needs.prepare.outputs.pg }}
+            type=raw,value=latest
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect \
+            "$IMAGE:${{ needs.prepare.outputs.pg }}-${{ needs.prepare.outputs.base_short }}-pp${{ needs.prepare.outputs.pathprobe_short }}"
