@@ -35,7 +35,7 @@ docker run -d --name pathprobe -e POSTGRES_PASSWORD=postgres -p 5432:5432 \
 Tags:
 
 - `<version>-<upstream sha>-pp<pathprobe sha>`, e.g.
-  `20devel-425daf545d91-pp6bed14e`;
+  `20devel-425daf545d91-ppd56ffe5`;
 - `<version>`, e.g. `20devel`, and `latest`: the most recent build.
 
 The image uses the entrypoint of the official `postgres` image, so

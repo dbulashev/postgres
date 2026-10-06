@@ -39,7 +39,7 @@ env:
   # commit (r2d2/path-graph-json-fixes: kept field, path properties, real
   # REJECTED dominator).  The jobs after prepare use the resolved sha, so a
   # branch passed to a manual run cannot move between them.
-  PATHPROBE_REF: ${{ inputs.pathprobe_ref || '6bed14e246f23882124cb6efb5f2a6538515d4f4' }}
+  PATHPROBE_REF: ${{ inputs.pathprobe_ref || 'd56ffe5e9f127e4fbd4ad602299b7caff94cfaaf' }}
 
 jobs:
   prepare:
