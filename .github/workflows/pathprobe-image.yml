@@ -35,10 +35,10 @@ concurrency:
 env:
   PATHPROBE_REPO: obartunov/pathprobe
   # Pinned: the core hooks patch and the extension must come from the same
-  # commit (r2d2/advisor-output-audit, 2026-10-03).  The jobs after prepare
-  # use the resolved sha, so a branch passed to a manual run cannot move
-  # between them.
-  PATHPROBE_REF: ${{ inputs.pathprobe_ref || '32f63f301750a52fcf8125310c0d9b19571d4fe6' }}
+  # commit (r2d2/path-graph: path_id and graph edges in JSON).  The jobs after
+  # prepare use the resolved sha, so a branch passed to a manual run cannot
+  # move between them.
+  PATHPROBE_REF: ${{ inputs.pathprobe_ref || 'a7f1bd7ccd984f77d25ce4a2882f636db3505d59' }}
 
 jobs:
   prepare:
