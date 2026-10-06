@@ -1,0 +1,863 @@
+From 6bed14e246f23882124cb6efb5f2a6538515d4f4 Mon Sep 17 00:00:00 2001
+From: Dmitry Bulashev <d.bulashev@gmail.com>
+Date: Tue, 6 Oct 2026 09:58:08 +0500
+Subject: [PATCH 3/5] pathprobe: name the real dominator of a REJECTED path
+
+The core hook was called after the add_path() loop with
+parent_rel->cheapest_total_path as a proxy for the dominating path.
+set_cheapest() has not run while a rel is being populated, so the proxy
+was usually NULL, and where it was set it was the cheapest total path,
+not necessarily the path that won the comparison (a path can lose on
+startup cost, pathkeys or parameterization to another one).  A
+consumer could not draw a "rejected by" edge.
+
+Core patch: keep old_path when the loop breaks on !accept_new and pass
+it to the rejected hook; it stays in the pathlist, so the pointer is
+valid during the hook.  The loop can also remove old paths that
+new_path dominates before it meets one that dominates new_path (fuzzy
+dominance is not transitive).  Those were freed after the hooks, but
+got no DISPLACED event and their ids were not forgotten, so a later
+path at a reused address could inherit one.  The rejected hook now also
+gets that list, which add_path() collects whenever either hook is set.
+The signature changes; HAVE_PATHPROBE_REAL_DOMINATOR and
+HAVE_PATHPROBE_REJECTED_DOMINATED_LIST in pathnode.h let the extension
+build against both versions.
+
+Extension: a REJECTED event records the dominator's path_id; JSON emits
+dominator_path_id and other_pathtype, gated by the new coverage key
+add_path_rejected_dominator, so the proxy of an older core is never
+reported as a dominator.  There is no dominator_seq: the dominator was
+accepted earlier, possibly without a recorded event.  Paths a rejected
+path removed get DISPLACED events after its REJECTED event, with the
+rejected path as displacer (under pathprobe.log_accepted, as in the
+accepted hook), and their ids are forgotten.  gap_cost of REJECTED is
+now measured against the dominator, so it is non-zero, the text output
+shows lost_by for rejected paths, and pathprobe.min_gap filters them.
+
+pathprobe_graph checks that every REJECTED event names a path
+accepted into the same rel earlier, never itself, whose type matches
+other_pathtype; the Perl model checks the same references and accepts
+a REJECTED event at displacer_seq.  The removed-before-rejected case is
+not triggered by a test.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ README.md                             |   6 +-
+ docs/technical/event-model.md         |   5 +-
+ docs/technical/implementation.md      |  11 ++-
+ docs/technical/json-format.md         |  42 +++++++--
+ docs/technical/output-format-audit.md |   9 +-
+ expected/pathprobe.out                |   4 +-
+ expected/pathprobe_graph.out          |  22 +++++
+ expected/pathprobe_lifecycle.out      |   6 +-
+ patches/APPLYING.md                   |   7 +-
+ patches/pathprobe-core-hooks.patch    |  65 ++++++++-----
+ pathprobe.c                           |   5 +-
+ pathprobe.h                           |  15 ++-
+ pathprobe_json.c                      |  23 ++++-
+ pathprobe_probe1.c                    | 128 ++++++++++++++++----------
+ sql/pathprobe_graph.sql               |  18 ++++
+ t/PathprobeModel.pm                   |  20 +++-
+ 16 files changed, 285 insertions(+), 101 deletions(-)
+
+diff --git a/README.md b/README.md
+index 476140a..96d5c42 100644
+--- a/README.md
++++ b/README.md
+@@ -247,9 +247,9 @@ docs/testing/                     model-based tests, generator, test matrix
+   carry no label; their outcome is `unknown(outcome_not_observed)`.
+ - When `apply_scanjoin_target_to_paths()` rebuilds a pathlist, the paths it
+   drops produce no DISPLACED event.
+-- REJECTED events do not identify the dominating path (the core hook passes
+-  the rel's cheapest total path as a proxy).  `path_id` may conflate join
+-  paths under GEQO, and any paths without the core patch.
++- REJECTED events name their dominator only with a core hooks patch that
++  passes it (`coverage.add_path_rejected_dominator`).  `path_id` may
++  conflate join paths under GEQO, and any paths without the core patch.
+ - The advisor is a local candidate generator with known defects (OR
+   clauses, duplicate expression indexes, hypothetical btree costing); see
+   [advisor audit](docs/technical/advisor-audit.md).
+diff --git a/docs/technical/event-model.md b/docs/technical/event-model.md
+index 397ad74..1ac8740 100644
+--- a/docs/technical/event-model.md
++++ b/docs/technical/event-model.md
+@@ -33,11 +33,14 @@ kept            SURVIVED of a real path kept without being the cheapest
+ path_id         identity of the path within this result (null without a Path)
+ displacer_path_id, displacer_seq, other_pathtype
+                 DISPLACED only: the path that displaced this one, its
+-                ACCEPTED event and its type
++                ACCEPTED (or REJECTED) event and its type
++dominator_path_id, other_pathtype
++                REJECTED only: the path this one lost to and its type
+ cost_startup, cost_total
+                 path costs where meaningful
+ required_outer  SKIPPED only: rels the join would be parameterized by
+ gap_cost        difference from local competitor where meaningful
++                (for REJECTED, from the dominator)
+ skip_reason     precheck reason where available
+ disabled_nodes  planner disabled-nodes marker
+ ```
+diff --git a/docs/technical/implementation.md b/docs/technical/implementation.md
+index b5fa32d..4f1f512 100644
+--- a/docs/technical/implementation.md
++++ b/docs/technical/implementation.md
+@@ -115,10 +115,13 @@ aggregates events per relation, bounded by `max_summary_entries` with a
+ ```text
+ probe0  set_rel_pathlist_hook: survivors visible without the core patch
+ probe1  pathprobe_probe1.c: add_path frontier - PEK_REJECTED (lost to an
+-        existing path), PEK_ACCEPTED (entered the pathlist) followed by one
+-        PEK_DISPLACED per path it removed (from the dominated list the core
+-        patch keeps alive until the hook returns), both only with
+-        pathprobe.log_accepted, and precheck PEK_SKIPPED; each event asks
++        existing path, which the core patch passes as the dominator),
++        PEK_ACCEPTED (entered the pathlist) followed by one PEK_DISPLACED
++        per path it removed (from the dominated list the core patch keeps
++        alive until the hook returns), both only with
++        pathprobe.log_accepted, and precheck PEK_SKIPPED; a rejected path
++        may also have removed paths before it lost: those get PEK_DISPLACED
++        events after its PEK_REJECTED; each event asks
+         pathprobe_path_label() for an optional label
+ probe2  pathprobe_probe2.c: join-level observation (setup/pathlist/search),
+         gated by pathprobe.enable_probe2
+diff --git a/docs/technical/json-format.md b/docs/technical/json-format.md
+index 65b587f..fdd2ffa 100644
+--- a/docs/technical/json-format.md
++++ b/docs/technical/json-format.md
+@@ -72,6 +72,17 @@ A DISPLACED event also names the path that displaced it:
+ }
+ ```
+ 
++A REJECTED event names the path it lost to:
++
++```json
++{
++  "seq": 23, "src": "p1", "rel": "{1,2}", "pathtype": "HashJoin",
++  "kind": "rejected", "path_id": 14,
++  "dominator_path_id": 12, "other_pathtype": "NestLoop",
++  "gap_cost": 41.3
++}
++```
++
+ Rules:
+ 
+ ```text
+@@ -86,8 +97,18 @@ cost_startup and cost_total are the path's costs at the event; for skipped
+   events, the lower bounds precheck compared
+ required_outer is on skipped events only, when non-empty; for other events
+   it is a property of the path, in paths[]
+-displacer_seq is null if the displacer's ACCEPTED event was not recorded
+-  (event cap)
++displacer_seq is the seq of the displacer's ACCEPTED event, or of its
++  REJECTED event: add_path() can remove old paths and then meet one that
++  dominates the new path (fuzzy dominance is not transitive); null if that
++  event was not recorded (event cap)
++dominator_path_id, other_pathtype on REJECTED events: the path in the rel's
++  pathlist that dominated this one, and its type.  Present only with
++  coverage.add_path_rejected_dominator; null if the id could not be assigned
++  (event cap).  There is no dominator_seq: the dominator was accepted
++  earlier, possibly without a recorded event; find it by path_id
++gap_cost of a REJECTED event is cost_total minus the dominator's total;
++  negative when the path lost on startup cost, pathkeys or
++  parameterization rather than on total
+ ```
+ 
+ ## paths[]
+@@ -161,9 +182,9 @@ memory gets a new id.
+ Limits: with GEQO the planner frees join paths by resetting memory without
+ `add_path()`, so ids of join paths may be conflated there (a node-type and
+ parent-rel check guards against most cases); without the core hooks patch
+-pathprobe does not see any free, so the same holds for every path.  REJECTED
+-events do not identify the dominating path: the core hook passes the rel's
+-cheapest total path as a proxy.  `paths[]` is in the JSON only; the text
++pathprobe does not see any free, so the same holds for every path.  With an
++older core hooks patch REJECTED events do not identify the dominating path
++(`coverage.add_path_rejected_dominator` is false).  `paths[]` is in the JSON only; the text
+ output and the `EXPLAIN` integration do not show ids.
+ 
+ ## candidates[]
+@@ -276,7 +297,8 @@ If any truncation flag is true, an agent should not make a green decision.
+   "add_path_displaced": true,
+   "add_path_precheck": true,
+   "join_excluded": true,
+-  "index_build": false
++  "index_build": false,
++  "add_path_rejected_dominator": true
+ }
+ ```
+ 
+@@ -290,6 +312,10 @@ index with no events is `unknown(index_build_not_covered)`.
+ add_path_accepted, add_path_displaced  core hooks patch and pathprobe.log_accepted
+                                        (pathprobe_propose* turn it on)
+ add_path_rejected                      core hooks patch and pathprobe.min_gap = 0
++add_path_rejected_dominator            core hooks patch that passes the real
++                                       dominator (HAVE_PATHPROBE_REAL_DOMINATOR);
++                                       says what recorded rejected events
++                                       carry, not that all were recorded
+ add_path_precheck                      core hooks patch
+ join_excluded                          pathprobe.enable_probe2
+ survived_snapshot                      always
+@@ -325,6 +351,10 @@ replacement for labeled candidate events.  There is no displaced column; count
+      (1.1 reported them as "proposed" with label "  kept: ...")
+      cost_startup on events, required_outer on skipped events; rows,
+      required_outer, index_oid, index and index_hypothetical in paths[]
++     dominator_path_id and other_pathtype on rejected events, coverage
++     add_path_rejected_dominator; gap_cost of rejected events is measured
++     against the dominator; displaced events for paths a rejected path
++     removed before it lost, with displacer_seq at the REJECTED event
+ 1.1  first versioned format; path_id, displacer_path_id, displacer_seq and
+      paths[] were added later without a version change
+ ```
+diff --git a/docs/technical/output-format-audit.md b/docs/technical/output-format-audit.md
+index 9ebccd7..148f8b8 100644
+--- a/docs/technical/output-format-audit.md
++++ b/docs/technical/output-format-audit.md
+@@ -181,10 +181,11 @@ In order of value.  Items marked done were implemented after the audit.
+ 
+ 1. Done: `kept: startup` / `kept: order?` moved out of `label` into the
+    `kept` event field, so `origin` stays `real` for real paths.
+-2. Done for DISPLACED events (`displacer_path_id`, `displacer_seq`,
+-   `other_pathtype`, with `path_id` on every path event and child edges in
+-   `paths[]`).  REJECTED events still name no dominator: the core hook
+-   passes the rel's cheapest total path as a proxy, which is not one.
++2. Done (`displacer_path_id`, `displacer_seq`, `other_pathtype` on
++   DISPLACED events, with `path_id` on every path event and child edges in
++   `paths[]`).  REJECTED events name their dominator (`dominator_path_id`,
++   `other_pathtype`): the core hook now passes the old path that dominated
++   the new one instead of the rel's cheapest total path.
+ 3. Add the displaced count to the text line of a hypothetical index.
+ 4. Omit the empty legacy `target` and `candidate` blocks when the call has no
+    explicit candidate, as already done for the top-level `fate`.
+diff --git a/expected/pathprobe.out b/expected/pathprobe.out
+index d08921b..ac0e09e 100644
+--- a/expected/pathprobe.out
++++ b/expected/pathprobe.out
+@@ -19,7 +19,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM pp_t WHERE id = 42;
+  -------------------------------------------------------------------
+   seq  src  rel           pathtype              cost_total  gap                     event
+  -------------------------------------------------------------------
+- #1    p1  {1}           BitmapHeapScan                                            REJECTED
++ #1    p1  {1}           BitmapHeapScan                    lost_by                 REJECTED
+  #2    p0  {1}           IndexScan                                                 survived
+  -------------------------------------------------------------------
+  total events: 2
+@@ -51,7 +51,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM pp_t WHERE v BETWEEN 5 AND 8 ORDER BY v;
+  -------------------------------------------------------------------
+  #1    p0  {1}           BitmapHeapScan                                            survived
+  #2    p0  {1}           IndexScan                                                 survived  kept: startup
+- #3    p1  ?             IndexScan                                                 REJECTED
++ #3    p1  ?             IndexScan                         lost_by                 REJECTED
+  -------------------------------------------------------------------
+  total events: 3
+  
+diff --git a/expected/pathprobe_graph.out b/expected/pathprobe_graph.out
+index 36d0143..c8ee5f2 100644
+--- a/expected/pathprobe_graph.out
++++ b/expected/pathprobe_graph.out
+@@ -17,6 +17,7 @@ SELECT (e->>'seq')::int AS seq, e->>'kind' AS kind, e->>'rel' AS rel,
+        e->>'pathtype' AS pathtype, (e->>'path_id')::int AS path_id,
+        (e->>'displacer_path_id')::int AS displacer_path_id,
+        (e->>'displacer_seq')::int AS displacer_seq,
++       (e->>'dominator_path_id')::int AS dominator_path_id,
+        e->>'other_pathtype' AS other_pathtype,
+        (e->>'cost_startup')::float8 AS cost_startup,
+        (e->>'cost_total')::float8 AS cost_total,
+@@ -177,4 +178,25 @@ SELECT (SELECT count(*) > 0 FROM p) AS has_hypo_path,
+  t             | t              | t
+ (1 row)
+ 
++-- 8. a REJECTED event names the path it lost to: one accepted into the
++-- same rel before, never the rejected path itself, of the type it reports
++SELECT
++  (SELECT (j->'coverage'->>'add_path_rejected_dominator')::bool FROM gr_j) AS covered,
++  (SELECT count(*) > 0 FROM gr_ev WHERE kind = 'rejected') AS has_rejected,
++  (SELECT bool_and(EXISTS (SELECT 1 FROM gr_ev a WHERE a.kind = 'accepted'
++                           AND a.path_id = r.dominator_path_id
++                           AND a.rel = r.rel AND a.seq < r.seq))
++   FROM gr_ev r WHERE r.kind = 'rejected')
++    AS dominator_accepted_before,
++  (SELECT bool_and(dominator_path_id <> path_id) FROM gr_ev WHERE kind = 'rejected')
++    AS dominator_is_another_path,
++  (SELECT bool_and(d.pathtype = r.other_pathtype)
++   FROM gr_ev r JOIN gr_paths d ON d.path_id = r.dominator_path_id
++   WHERE r.kind = 'rejected')
++    AS other_pathtype_is_dominators;
++ covered | has_rejected | dominator_accepted_before | dominator_is_another_path | other_pathtype_is_dominators 
++---------+--------------+---------------------------+---------------------------+------------------------------
++ t       | t            | t                         | t                         | t
++(1 row)
++
+ DROP TABLE gr_o, gr_c;
+diff --git a/expected/pathprobe_lifecycle.out b/expected/pathprobe_lifecycle.out
+index 76e0740..cbf223b 100644
+--- a/expected/pathprobe_lifecycle.out
++++ b/expected/pathprobe_lifecycle.out
+@@ -43,9 +43,9 @@ ORDER BY n;
+ -- 3. coverage: propose observes acceptance and displacement; with min_gap
+ -- set, rejections are not covered
+ SELECT pathprobe_propose_json('SELECT * FROM lc_a WHERE id = 7', '{"advise":true}')::jsonb->'coverage' AS coverage;
+-                                                                                       coverage                                                                                       
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+- {"index_build": true, "join_excluded": true, "add_path_accepted": true, "add_path_precheck": true, "add_path_rejected": true, "survived_snapshot": true, "add_path_displaced": true}
++                                                                                                         coverage                                                                                                          
++---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
++ {"index_build": true, "join_excluded": true, "add_path_accepted": true, "add_path_precheck": true, "add_path_rejected": true, "survived_snapshot": true, "add_path_displaced": true, "add_path_rejected_dominator": true}
+ (1 row)
+ 
+ SET pathprobe.min_gap = 1;
+diff --git a/patches/APPLYING.md b/patches/APPLYING.md
+index 3a1b34d..7c25279 100644
+--- a/patches/APPLYING.md
++++ b/patches/APPLYING.md
+@@ -20,4 +20,9 @@ patch adds the add_path/rel-level observation hooks used by probe1 and
+ the proposed-path frontier check, and the build_index_paths() decision hook
+ used for hypothetical-index fate.  The latter is detected separately through
+ HAVE_PATHPROBE_INDEX_PATH_HOOK, so a server built with an older copy of the
+-patch still works, without index-build coverage.
++patch still works, without index-build coverage.  In the same way
++HAVE_PATHPROBE_REAL_DOMINATOR (the rejected hook gets the old path that
++dominated the new one, not the cheapest total path) and
++HAVE_PATHPROBE_REJECTED_DOMINATED_LIST (the rejected hook also gets the
++paths the new one removed before it lost) select what the extension
++reports; without them REJECTED events name no dominator.
+diff --git a/patches/pathprobe-core-hooks.patch b/patches/pathprobe-core-hooks.patch
+index 6760025..560af2a 100644
+--- a/patches/pathprobe-core-hooks.patch
++++ b/patches/pathprobe-core-hooks.patch
+@@ -216,10 +216,10 @@ index 713283a..f68c6d3 100644
+  }
+  
+ diff --git a/src/backend/optimizer/util/pathnode.c b/src/backend/optimizer/util/pathnode.c
+-index 73518c8..fcb8d2f 100644
++index 67c47fd..0200210 100644
+ --- a/src/backend/optimizer/util/pathnode.c
+ +++ b/src/backend/optimizer/util/pathnode.c
+-@@ -55,6 +55,32 @@ static bool pathlist_is_reparameterizable_by_child(List *pathlist,
++@@ -55,6 +55,34 @@ static bool pathlist_is_reparameterizable_by_child(List *pathlist,
+  												   RelOptInfo *child_rel);
+  
+  
+@@ -227,14 +227,16 @@ index 73518c8..fcb8d2f 100644
+ + * pathprobe hooks — add_path competition probe
+ + *
+ + * Both default to NULL (no-op). pathprobe.so sets them in _PG_init().
+-+ * pathprobe_path_rejected_hook: new_path dominated; dominated_by is
+-+ *   cheapest_total_path proxy. new_path pfree'd after hook returns.
+++ * pathprobe_path_rejected_hook: new_path dominated by the old path
+++ *   dominated_by; dominated_list may be NIL.  new_path pfree'd after hook
+++ *   returns.
+ + * pathprobe_path_accepted_hook: new_path survived; dominated_list may be NIL.
+ + *   Paths in dominated_list are freed only after the hook returns.
+ + */
+ +typedef void (*pathprobe_path_rejected_hook_type)(RelOptInfo *rel,
+ +												  Path *new_path,
+-+												  Path *dominated_by);
+++												  Path *dominated_by,
+++												  List *dominated_list);
+ +typedef void (*pathprobe_path_accepted_hook_type)(RelOptInfo *rel,
+ +												  Path *new_path,
+ +												  List *dominated_list);
+@@ -252,26 +254,35 @@ index 73518c8..fcb8d2f 100644
+  /*****************************************************************************
+   *		MISC. PATH UTILITIES
+   *****************************************************************************/
+-@@ -460,6 +486,7 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
++@@ -460,6 +488,8 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
+  {
+  	bool		accept_new = true;	/* unless we find a superior old path */
+  	int			insert_at = 0;	/* where to insert new item */
+-+	List	   *dominated_paths = NIL;	/* paths new_path displaces, for hook */
+++	List	   *dominated_paths = NIL;	/* paths new_path displaces, for hooks */
+++	Path	   *dominator = NULL;	/* old path that dominates new_path */
+  	List	   *new_path_pathkeys;
+  	ListCell   *p1;
+  
+-@@ -627,7 +654,9 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
++@@ -627,7 +657,9 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
+  			/*
+  			 * Delete the data pointed-to by the deleted cell, if possible
+  			 */
+ -			if (!IsA(old_path, IndexPath))
+-+			if (pathprobe_path_accepted_hook)
+++			if (pathprobe_path_accepted_hook || pathprobe_path_rejected_hook)
+ +				dominated_paths = lappend(dominated_paths, old_path);
+ +			else if (!IsA(old_path, IndexPath))
+  				pfree(old_path);
+  		}
+  		else
+-@@ -653,16 +682,39 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
++@@ -648,21 +680,47 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
++ 		 * new_path cannot dominate any other elements of the pathlist.
++ 		 */
++ 		if (!accept_new)
+++		{
+++			dominator = old_path;
++ 			break;
+++		}
++ 	}
+  
+  	if (accept_new)
+  	{
+@@ -285,22 +296,22 @@ index 73518c8..fcb8d2f 100644
+  	else
+  	{
+ +		/*
+-+		 * new_path was rejected. Pass cheapest_total_path as proxy for
+-+		 * the dominating path — honest approximation; actual dominator
+-+		 * may differ for startup-cost or parameterized comparisons.
+++		 * new_path was rejected.  dominator is the old path it lost to; it
+++		 * stays in the pathlist.  dominated_paths are old paths new_path
+++		 * removed before the loop met dominator.
+ +		 */
+ +		if (pathprobe_path_rejected_hook)
+-+			pathprobe_path_rejected_hook(parent_rel, new_path,
+-+										 parent_rel->cheapest_total_path);
+++			pathprobe_path_rejected_hook(parent_rel, new_path, dominator,
+++										 dominated_paths);
+  		/* Reject and recycle the new path */
+  		if (!IsA(new_path, IndexPath))
+  			pfree(new_path);
+  	}
+ +
+ +	/*
+-+	 * Free the old paths the loop removed but kept for the accepted hook.
+-+	 * This is needed on the reject path too: the loop may remove old paths
+-+	 * before it finds one that dominates new_path.
+++	 * Free the old paths the loop removed but kept for the hooks.  This is
+++	 * needed on the reject path too: the loop may remove old paths before it
+++	 * finds one that dominates new_path.
+ +	 */
+ +	foreach_ptr(Path, dpath, dominated_paths)
+ +	{
+@@ -312,10 +323,10 @@ index 73518c8..fcb8d2f 100644
+  
+  /*
+ diff --git a/src/include/optimizer/pathnode.h b/src/include/optimizer/pathnode.h
+-index e8db321..00843de 100644
++index da2d9b3..8dfd6de 100644
+ --- a/src/include/optimizer/pathnode.h
+ +++ b/src/include/optimizer/pathnode.h
+-@@ -17,6 +17,43 @@
++@@ -17,6 +17,53 @@
+  #include "nodes/bitmapset.h"
+  #include "nodes/pathnodes.h"
+  
+@@ -325,14 +336,24 @@ index e8db321..00843de 100644
+ + *
+ + * pathprobe_path_rejected_hook: called when new_path is dominated.
+ + *   new_path will be pfree'd after hook returns; snapshot all needed fields.
+-+ *   dominated_by is cheapest_total_path proxy (best available approximation).
+++ *   dominated_by is the old path that dominates new_path; it stays in the
+++ *   pathlist.  dominated_list: old paths new_path removed before add_path()
+++ *   found dominated_by (may be NIL; fuzzy dominance is not transitive).
+ + *
+ + * pathprobe_path_accepted_hook: called when new_path survives.
+ + *   dominated_list: paths displaced by new_path (may be NIL).
+++ *
+++ * Paths in dominated_list are freed only after either hook returns.
+++ * Defining the macros lets an extension detect the meaning of dominated_by
+++ * and the rejected hook's dominated_list argument.
+ + */
+++#define HAVE_PATHPROBE_REAL_DOMINATOR 1
+++#define HAVE_PATHPROBE_REJECTED_DOMINATED_LIST 1
+++
+ +typedef void (*pathprobe_path_rejected_hook_type)(RelOptInfo *rel,
+ +												  Path *new_path,
+-+												  Path *dominated_by);
+++												  Path *dominated_by,
+++												  List *dominated_list);
+ +typedef void (*pathprobe_path_accepted_hook_type)(RelOptInfo *rel,
+ +												  Path *new_path,
+ +												  List *dominated_list);
+diff --git a/pathprobe.c b/pathprobe.c
+index 5fb9a0d..60a12ba 100644
+--- a/pathprobe.c
++++ b/pathprobe.c
+@@ -257,9 +257,12 @@ pathprobe_coverage(void)
+ 
+ #ifdef HAVE_PATHPROBE_HOOKS
+ 	cov |= PP_COV_PRECHECK;
+-	/* with min_gap > 0 the rejected hook drops events whose gap is 0 */
++	/* with min_gap > 0 the rejected hook drops events with a small gap */
+ 	if (pathprobe_min_gap <= 0.0)
+ 		cov |= PP_COV_REJECTED;
++#ifdef HAVE_PATHPROBE_REAL_DOMINATOR
++	cov |= PP_COV_REJECTED_DOMINATOR;
++#endif
+ 	if (pathprobe_log_accepted)
+ 		cov |= PP_COV_ACCEPTED | PP_COV_DISPLACED;
+ #endif
+diff --git a/pathprobe.h b/pathprobe.h
+index 1c4072d..7a3ecf8 100644
+--- a/pathprobe.h
++++ b/pathprobe.h
+@@ -22,6 +22,7 @@
+ 
+ #include "postgres.h"
+ #include "nodes/pathnodes.h"
++#include "optimizer/pathnode.h" /* HAVE_PATHPROBE_* of the core patch */
+ #include "optimizer/paths.h"	/* JoinPathExtraData, PGS_* */
+ #include "lib/stringinfo.h"
+ 
+@@ -123,7 +124,8 @@ typedef struct PathEvent
+ 	 * competition context (probe1 add_path events only)
+ 	 *
+ 	 * gap_cost semantics by kind: REJECTED:  path.cost_total -
+-	 * winner.cost_total  (positive = lost) ACCEPTED with displacement:
++	 * dominator.cost_total  (positive = lost on total; negative = lost on
++	 * startup, pathkeys or parameterization) ACCEPTED with displacement:
+ 	 * displaced.cost_total - path.cost_total (positive = improvement over
+ 	 * displaced) SURVIVED / GENERATED: 0.0 (not applicable)
+ 	 */
+@@ -144,7 +146,9 @@ typedef struct PathEvent
+ 	 * Path identity within this log (see pelog_path_id); 0 when the event
+ 	 * has no Path (SKIPPED, EXCLUDED).  For DISPLACED, link_path_id is the
+ 	 * path that displaced this one and link_seq the seq of its ACCEPTED
+-	 * event (0 if that event was not recorded).
++	 * event, or of its REJECTED event if it displaced this one and then lost
++	 * to another path (0 if that event was not recorded).  For REJECTED,
++	 * link_path_id is the dominating path (PP_COV_REJECTED_DOMINATOR).
+ 	 */
+ 	int			path_id;
+ 	int			link_path_id;
+@@ -236,6 +240,8 @@ typedef struct PathEventLog
+ #define PP_COV_EXCLUDED		0x20	/* join methods excluded at join setup */
+ #define PP_COV_INDEX_BUILD	0x40	/* build_index_paths() decision for
+ 									 * hypothetical indexes (propose) */
++#define PP_COV_REJECTED_DOMINATOR 0x80	/* add_path() passes the real
++										 * dominator of a rejected path */
+ 
+ extern uint32 pathprobe_coverage(void);
+ 
+@@ -344,8 +350,13 @@ extern void probe_skipped_hook(RelOptInfo *joinrel, NodeTag join_pathtype,
+ 							   Relids required_outer);
+ 
+ /* probe1 hook implementations (pathprobe_probe1.c) */
++#ifdef HAVE_PATHPROBE_REJECTED_DOMINATED_LIST
++extern void probe1_rejected_hook(RelOptInfo *rel, Path *new_path,
++								 Path *dominated_by, List *dominated_list);
++#else
+ extern void probe1_rejected_hook(RelOptInfo *rel, Path *new_path,
+ 								 Path *dominated_by);
++#endif
+ extern void probe1_accepted_hook(RelOptInfo *rel, Path *new_path,
+ 								 List *dominated_list);
+ 
+diff --git a/pathprobe_json.c b/pathprobe_json.c
+index 50d4167..f8f302b 100644
+--- a/pathprobe_json.c
++++ b/pathprobe_json.c
+@@ -184,6 +184,23 @@ render_json(PathProbeReport *report, StringInfo out, PathProbeOpts *opts,
+ 			appendStringInfoString(out, ",\"other_pathtype\":");
+ 			json_str(out, pathtype_name(ev->other_pathtype));
+ 		}
++
++		/*
++		 * No dominator_seq: the dominator was accepted earlier, possibly
++		 * without a recorded event; it is found by path_id.  Without the
++		 * coverage bit the hook passed a proxy, which is not emitted.
++		 */
++		if (ev->kind == PEK_REJECTED &&
++			(log->coverage & PP_COV_REJECTED_DOMINATOR))
++		{
++			if (ev->link_path_id > 0)
++				appendStringInfo(out, ",\"dominator_path_id\":%d",
++								 ev->link_path_id);
++			else
++				appendStringInfoString(out, ",\"dominator_path_id\":null");
++			appendStringInfoString(out, ",\"other_pathtype\":");
++			json_str(out, pathtype_name(ev->other_pathtype));
++		}
+ 		if (ev->label)
+ 		{
+ 			appendStringInfoString(out, ",\"label\":");
+@@ -296,11 +313,13 @@ render_json(PathProbeReport *report, StringInfo out, PathProbeOpts *opts,
+ 					 "  \"coverage\": {\"survived_snapshot\":%s,"
+ 					 "\"add_path_accepted\":%s,\"add_path_rejected\":%s,"
+ 					 "\"add_path_displaced\":%s,\"add_path_precheck\":%s,"
+-					 "\"join_excluded\":%s,\"index_build\":%s},\n",
++					 "\"join_excluded\":%s,\"index_build\":%s,"
++					 "\"add_path_rejected_dominator\":%s},\n",
+ 					 COV(PP_COV_SURVIVED), COV(PP_COV_ACCEPTED),
+ 					 COV(PP_COV_REJECTED), COV(PP_COV_DISPLACED),
+ 					 COV(PP_COV_PRECHECK), COV(PP_COV_EXCLUDED),
+-					 COV(PP_COV_INDEX_BUILD));
++					 COV(PP_COV_INDEX_BUILD),
++					 COV(PP_COV_REJECTED_DOMINATOR));
+ #undef COV
+ 	appendStringInfoString(out, "  \"summary\": [\n");
+ 	first = true;
+diff --git a/pathprobe_probe1.c b/pathprobe_probe1.c
+index 0aaff49..0cf611e 100644
+--- a/pathprobe_probe1.c
++++ b/pathprobe_probe1.c
+@@ -11,9 +11,13 @@
+  *
+  * The patch exposes two hooks in pathnode.c / pathnode.h:
+  *
+- *   pathprobe_path_rejected_hook(rel, new_path, dominated_by)
++ *   pathprobe_path_rejected_hook(rel, new_path, dominated_by, dominated_list)
+  *   pathprobe_path_accepted_hook(rel, new_path, dominated_list)
+  *
++ * Older versions of the patch pass no dominated_list to the rejected hook
++ * and the cheapest total path as dominated_by; HAVE_PATHPROBE_* macros in
++ * pathnode.h tell them apart.
++ *
+  * This adapter writes events to pathprobe_active_log when active.
+  * kind=PEK_REJECTED / PEK_ACCEPTED, source=PATH_SOURCE_ADD_PATH.
+  *
+@@ -44,24 +48,82 @@ extern double pathprobe_min_gap;
+ 
+ 
+ 
++/*
++ * probe1_displaced - one DISPLACED event per path in dominated_list, which
++ * by (the event of new_path) removed from the pathlist, then forget their
++ * ids.  The core patch keeps these paths allocated until the hook returns;
++ * add_path() frees them afterwards, unless an IndexPath.  With record false
++ * only the ids are forgotten.
++ */
++static void
++probe1_displaced(const PathEvent *by, Path *new_path, List *dominated_list,
++				 bool record)
++{
++	foreach_ptr(Path, old_path, dominated_list)
++	{
++		if (record)
++		{
++			PathEvent	dev;
++			const char *dname = pathprobe_path_label(old_path);
++
++			memset(&dev, 0, sizeof(dev));
++			dev.relids = by->relids;
++			dev.relid = InvalidOid;
++			dev.pathtype = old_path->pathtype;
++			dev.cost_startup = old_path->startup_cost;
++			dev.cost_total = old_path->total_cost;
++			dev.disabled_nodes = old_path->disabled_nodes;
++			dev.kind = PEK_DISPLACED;
++			dev.origin = PATH_ORIGIN_REAL;
++			dev.source = PATH_SOURCE_ADD_PATH;
++			dev.is_parameterized = (old_path->param_info != NULL);
++			dev.gap_cost = old_path->total_cost - new_path->total_cost;
++			dev.other_pathtype = new_path->pathtype;
++			if (dname)
++				dev.label = MemoryContextStrdup(pathprobe_active_log->mcxt, dname);
++			dev.path_id = pelog_path_id(pathprobe_active_log, old_path);
++			dev.link_path_id = by->path_id;
++			dev.link_seq = by->seq;
++			pelog_append(pathprobe_active_log, &dev);
++		}
++
++		if (!IsA(old_path, IndexPath))
++			pelog_path_forget(pathprobe_active_log, old_path);
++	}
++}
++
+ /*
+  * probe1_rejected_hook
+  *
+- * Called by add_path() when new_path is dominated.
+- * dominated_by is parent_rel->cheapest_total_path at call time.  NOTE:
+- * set_cheapest() has not yet run while add_path() is populating the rel
+- * (allpaths.c:607, joinrels.c:1538), so in practice dominated_by is NULL
+- * and gap stays 0; the min_gap filter below does not apply to REJECTED
+- * until the core patch passes the actual dominating old_path.
++ * Called by add_path() when new_path is dominated.  With
++ * HAVE_PATHPROBE_REAL_DOMINATOR, dominated_by is the old path that
++ * dominated new_path; it stays in the pathlist, so it is registered and
++ * its id goes into the event.  An older core patch passes
++ * parent_rel->cheapest_total_path, which is NULL while add_path() is
++ * populating the rel (set_cheapest() has not run), so no id is recorded.
++ *
++ * dominated_list (HAVE_PATHPROBE_REJECTED_DOMINATED_LIST): old paths that
++ * new_path removed before add_path() found dominated_by.  Fuzzy cost
++ * comparison is not transitive, so this can happen.  They get DISPLACED
++ * events with new_path as the displacer, as in the accepted hook.
+  *
+  * Note: new_path may be pfree'd immediately after this call.
+  * We snapshot all needed fields before returning.
+  */
++#ifdef HAVE_PATHPROBE_REJECTED_DOMINATED_LIST
++void
++probe1_rejected_hook(RelOptInfo *rel, Path *new_path, Path *dominated_by,
++					 List *dominated_list)
++#else
+ void
+ probe1_rejected_hook(RelOptInfo *rel, Path *new_path, Path *dominated_by)
++#endif
+ {
+ 	PathEvent	ev;
+ 	double		gap;
++#ifndef HAVE_PATHPROBE_REJECTED_DOMINATED_LIST
++	List	   *dominated_list = NIL;	/* not passed by this core patch */
++#endif
+ 
+ 	if (pathprobe_active_log == NULL)
+ 		return;
+@@ -69,7 +131,7 @@ probe1_rejected_hook(RelOptInfo *rel, Path *new_path, Path *dominated_by)
+ 	/*
+ 	 * gap for REJECTED: how much more expensive new_path is vs the winner.
+ 	 * Positive = new_path lost (normal case). Negative = new_path lost on
+-	 * startup cost, not total.
++	 * startup cost, pathkeys or parameterization, not total.
+ 	 */
+ 	gap = dominated_by ? (new_path->total_cost - dominated_by->total_cost)
+ 		: 0.0;
+@@ -77,6 +139,7 @@ probe1_rejected_hook(RelOptInfo *rel, Path *new_path, Path *dominated_by)
+ 	/* Apply min_gap filter */
+ 	if (pathprobe_min_gap > 0.0 && fabs(gap) < pathprobe_min_gap)
+ 	{
++		probe1_displaced(NULL, new_path, dominated_list, false);
+ 		if (!IsA(new_path, IndexPath))
+ 			pelog_path_forget(pathprobe_active_log, new_path);
+ 		return;
+@@ -111,7 +174,13 @@ probe1_rejected_hook(RelOptInfo *rel, Path *new_path, Path *dominated_by)
+ 			ev.label = MemoryContextStrdup(pathprobe_active_log->mcxt, pname);
+ 	}
+ 	ev.path_id = pelog_path_id(pathprobe_active_log, new_path);
+-	pelog_append(pathprobe_active_log, &ev);
++#ifdef HAVE_PATHPROBE_REAL_DOMINATOR
++	ev.link_path_id = pelog_path_id(pathprobe_active_log, dominated_by);
++#endif
++	pelog_append(pathprobe_active_log, &ev);	/* sets ev.seq, or 0 if full */
++
++	/* new_path is registered above; forget it only after these events */
++	probe1_displaced(&ev, new_path, dominated_list, pathprobe_log_accepted);
+ 
+ 	/* add_path() frees a rejected path unless it is an IndexPath */
+ 	if (!IsA(new_path, IndexPath))
+@@ -137,11 +206,7 @@ probe1_accepted_hook(RelOptInfo *rel, Path *new_path, List *dominated_list)
+ 	if (!pathprobe_log_accepted)
+ 	{
+ 		/* not recorded, but add_path() frees them: forget their ids */
+-		foreach_ptr(Path, old_path, dominated_list)
+-		{
+-			if (!IsA(old_path, IndexPath))
+-				pelog_path_forget(pathprobe_active_log, old_path);
+-		}
++		probe1_displaced(NULL, new_path, dominated_list, false);
+ 		return;
+ 	}
+ 
+@@ -178,39 +243,8 @@ probe1_accepted_hook(RelOptInfo *rel, Path *new_path, List *dominated_list)
+ 	ev.path_id = pelog_path_id(pathprobe_active_log, new_path);
+ 	pelog_append(pathprobe_active_log, &ev);	/* sets ev.seq, or 0 if full */
+ 
+-	/*
+-	 * One DISPLACED event per path that new_path removed from the pathlist.
+-	 * The core patch keeps these paths allocated until this hook returns.
+-	 */
+-	foreach_ptr(Path, old_path, dominated_list)
+-	{
+-		PathEvent	dev;
+-		const char *dname = pathprobe_path_label(old_path);
+-
+-		memset(&dev, 0, sizeof(dev));
+-		dev.relids = ev.relids;
+-		dev.relid = InvalidOid;
+-		dev.pathtype = old_path->pathtype;
+-		dev.cost_startup = old_path->startup_cost;
+-		dev.cost_total = old_path->total_cost;
+-		dev.disabled_nodes = old_path->disabled_nodes;
+-		dev.kind = PEK_DISPLACED;
+-		dev.origin = PATH_ORIGIN_REAL;
+-		dev.source = PATH_SOURCE_ADD_PATH;
+-		dev.is_parameterized = (old_path->param_info != NULL);
+-		dev.gap_cost = old_path->total_cost - new_path->total_cost;
+-		dev.other_pathtype = new_path->pathtype;
+-		if (dname)
+-			dev.label = MemoryContextStrdup(pathprobe_active_log->mcxt, dname);
+-		dev.path_id = pelog_path_id(pathprobe_active_log, old_path);
+-		dev.link_path_id = ev.path_id;
+-		dev.link_seq = ev.seq;
+-		pelog_append(pathprobe_active_log, &dev);
+-
+-		/* freed by add_path() after this hook, unless an IndexPath */
+-		if (!IsA(old_path, IndexPath))
+-			pelog_path_forget(pathprobe_active_log, old_path);
+-	}
++	/* one DISPLACED event per path that new_path removed from the pathlist */
++	probe1_displaced(&ev, new_path, dominated_list, true);
+ }
+ 
+ /*
+diff --git a/sql/pathprobe_graph.sql b/sql/pathprobe_graph.sql
+index 2c9bcd7..da428ad 100644
+--- a/sql/pathprobe_graph.sql
++++ b/sql/pathprobe_graph.sql
+@@ -18,6 +18,7 @@ SELECT (e->>'seq')::int AS seq, e->>'kind' AS kind, e->>'rel' AS rel,
+        e->>'pathtype' AS pathtype, (e->>'path_id')::int AS path_id,
+        (e->>'displacer_path_id')::int AS displacer_path_id,
+        (e->>'displacer_seq')::int AS displacer_seq,
++       (e->>'dominator_path_id')::int AS dominator_path_id,
+        e->>'other_pathtype' AS other_pathtype,
+        (e->>'cost_startup')::float8 AS cost_startup,
+        (e->>'cost_total')::float8 AS cost_total,
+@@ -138,4 +139,21 @@ SELECT (SELECT count(*) > 0 FROM p) AS has_hypo_path,
+        (SELECT bool_or(e.e->>'label' = 'hypo:gr_hypo')
+         FROM e JOIN p ON e.e->'path_id' = p.p->'path_id') AS labelled;
+ 
++-- 8. a REJECTED event names the path it lost to: one accepted into the
++-- same rel before, never the rejected path itself, of the type it reports
++SELECT
++  (SELECT (j->'coverage'->>'add_path_rejected_dominator')::bool FROM gr_j) AS covered,
++  (SELECT count(*) > 0 FROM gr_ev WHERE kind = 'rejected') AS has_rejected,
++  (SELECT bool_and(EXISTS (SELECT 1 FROM gr_ev a WHERE a.kind = 'accepted'
++                           AND a.path_id = r.dominator_path_id
++                           AND a.rel = r.rel AND a.seq < r.seq))
++   FROM gr_ev r WHERE r.kind = 'rejected')
++    AS dominator_accepted_before,
++  (SELECT bool_and(dominator_path_id <> path_id) FROM gr_ev WHERE kind = 'rejected')
++    AS dominator_is_another_path,
++  (SELECT bool_and(d.pathtype = r.other_pathtype)
++   FROM gr_ev r JOIN gr_paths d ON d.path_id = r.dominator_path_id
++   WHERE r.kind = 'rejected')
++    AS other_pathtype_is_dominators;
++
+ DROP TABLE gr_o, gr_c;
+diff --git a/t/PathprobeModel.pm b/t/PathprobeModel.pm
+index f8f01f9..e479bcb 100644
+--- a/t/PathprobeModel.pm
++++ b/t/PathprobeModel.pm
+@@ -812,8 +812,10 @@ sub check_correctness {
+         push @fails, "emitted ".scalar(@ev)." events exceeds cap $cap" if defined $cap && @ev > $cap;
+     }
+     push @fails, "missing coverage object" unless ref($j->{coverage}) eq 'HASH';
+-    # path identity: ids resolve to paths[], DISPLACED links to its displacer
++    # path identity: ids resolve to paths[], DISPLACED links to its displacer,
++    # REJECTED to its dominator
+     {
++        my $dom_cov = ref($j->{coverage}) eq 'HASH' && $j->{coverage}{add_path_rejected_dominator};
+         my %node = map { ($_->{path_id} => $_) } grep { ref $_ eq 'HASH' } @{ $j->{paths} // [] };
+         my %by_seq = map { ($_->{seq} => $_) } grep { ref $_ eq 'HASH' } @ev;
+         push @fails, "missing paths array" unless ref($j->{paths}) eq 'ARRAY';
+@@ -825,12 +827,24 @@ sub check_correctness {
+             }
+             if (!defined $e->{path_id}) { push @fails, "$k event without path_id"; next; }
+             push @fails, "path_id $e->{path_id} not in paths[]" unless $node{$e->{path_id}};
++            if ($k eq 'rejected') {
++                push @fails, "rejected event without dominator_path_id"
++                    if $dom_cov && !exists $e->{dominator_path_id};
++                my $dom = $e->{dominator_path_id};
++                next unless defined $dom;
++                push @fails, "dominator_path_id $dom not in paths[]" unless $node{$dom};
++                push @fails, "rejected path $dom is its own dominator" if $dom == $e->{path_id};
++                push @fails, "other_pathtype does not match the dominator"
++                    if $node{$dom} && ($node{$dom}{pathtype} // '') ne ($e->{other_pathtype} // '');
++                next;
++            }
+             next unless $k eq 'displaced';
+             my $d = $e->{displacer_seq};
+             next unless defined $d;
+             my $a = $by_seq{$d};
+-            push @fails, "displacer_seq $d is not an accepted event"
+-                unless $a && ($a->{kind} // '') eq 'accepted';
++            # a path can displace others and then lose to another one
++            push @fails, "displacer_seq $d is not an accepted or rejected event"
++                unless $a && ($a->{kind} // '') =~ /^(?:accepted|rejected)$/;
+             push @fails, "displacer_path_id does not match the event at displacer_seq"
+                 if $a && (($a->{path_id} // -1) != ($e->{displacer_path_id} // -2));
+             push @fails, "other_pathtype does not match the displacer"
+-- 
+2.51.0
+

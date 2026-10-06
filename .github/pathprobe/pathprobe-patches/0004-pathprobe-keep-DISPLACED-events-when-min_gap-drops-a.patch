@@ -1,0 +1,65 @@
+From 9b10564668b795efb43ee467ef1bc0ef65d6b1aa Mon Sep 17 00:00:00 2001
+From: Dmitry Bulashev <d.bulashev@gmail.com>
+Date: Tue, 6 Oct 2026 10:08:41 +0500
+Subject: [PATCH 4/5] pathprobe: keep DISPLACED events when min_gap drops a
+ REJECTED one
+
+coverage.add_path_displaced does not depend on pathprobe.min_gap, but the
+rejected hook dropped the DISPLACED events of paths that new_path removed
+before it lost whenever min_gap filtered the REJECTED event itself.  Keep
+them, naming new_path by path_id with a null displacer_seq.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/technical/json-format.md |  4 +++-
+ pathprobe_probe1.c            | 17 +++++++++++++++--
+ 2 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/docs/technical/json-format.md b/docs/technical/json-format.md
+index fdd2ffa..ab6250a 100644
+--- a/docs/technical/json-format.md
++++ b/docs/technical/json-format.md
+@@ -100,7 +100,9 @@ required_outer is on skipped events only, when non-empty; for other events
+ displacer_seq is the seq of the displacer's ACCEPTED event, or of its
+   REJECTED event: add_path() can remove old paths and then meet one that
+   dominates the new path (fuzzy dominance is not transitive); null if that
+-  event was not recorded (event cap)
++  event was not recorded (event cap, or a REJECTED event dropped by
++  pathprobe.min_gap: the DISPLACED events are kept, since displacement is
++  covered whatever min_gap is)
+ dominator_path_id, other_pathtype on REJECTED events: the path in the rel's
+   pathlist that dominated this one, and its type.  Present only with
+   coverage.add_path_rejected_dominator; null if the id could not be assigned
+diff --git a/pathprobe_probe1.c b/pathprobe_probe1.c
+index 0cf611e..dc4e319 100644
+--- a/pathprobe_probe1.c
++++ b/pathprobe_probe1.c
+@@ -136,10 +136,23 @@ probe1_rejected_hook(RelOptInfo *rel, Path *new_path, Path *dominated_by)
+ 	gap = dominated_by ? (new_path->total_cost - dominated_by->total_cost)
+ 		: 0.0;
+ 
+-	/* Apply min_gap filter */
++	/*
++	 * Apply min_gap filter.  It drops the REJECTED event only: coverage
++	 * reports displacement as covered whatever min_gap is, so the paths
++	 * new_path removed before it lost still get their DISPLACED events,
++	 * naming new_path by id with no displacer seq.
++	 */
+ 	if (pathprobe_min_gap > 0.0 && fabs(gap) < pathprobe_min_gap)
+ 	{
+-		probe1_displaced(NULL, new_path, dominated_list, false);
++		if (dominated_list != NIL && pathprobe_log_accepted)
++		{
++			memset(&ev, 0, sizeof(ev));
++			ev.relids = pelog_intern_relids(pathprobe_active_log, rel->relids);
++			ev.path_id = pelog_path_id(pathprobe_active_log, new_path);
++			probe1_displaced(&ev, new_path, dominated_list, true);
++		}
++		else
++			probe1_displaced(NULL, new_path, dominated_list, false);
+ 		if (!IsA(new_path, IndexPath))
+ 			pelog_path_forget(pathprobe_active_log, new_path);
+ 		return;
+-- 
+2.51.0
+

@@ -15,15 +15,30 @@ ways and are not combined.
 
 ## Source
 
-Nothing from pathprobe is copied here.  The workflow checks out
-<https://github.com/obartunov/pathprobe> at `PATHPROBE_REF` (pinned to a
-commit in the workflow) into `pathprobe-src/`, applies
-`pathprobe-src/patches/pathprobe-core-hooks.patch` to the tree with
+The workflow checks out <https://github.com/obartunov/pathprobe> at
+`PATHPROBE_REF` (pinned to a commit in the workflow) into `pathprobe-src/`,
+applies `pathprobe-src/patches/pathprobe-core-hooks.patch` to the tree with
 `apply-patches.sh`, and builds the extension from the same checkout, so the
 hooks and the extension always come from one commit.
 
 To take a newer pathprobe, change `PATHPROBE_REF` in the workflow, or run it
 manually with the `pathprobe_ref` input.
+
+### Local pathprobe patches
+
+Changes that are not in the pathprobe repository yet can be built and tested
+here first: put them as `git format-patch` files into `pathprobe-patches/`.
+`apply-patches.sh` applies them to the pathprobe checkout with `git am`
+before the core hooks patch (they may change it), and the image tag gets a
+`-local<hash>` suffix, a hash of the series.
+
+```sh
+cd <pathprobe checkout>
+git format-patch <PATHPROBE_REF>..<branch> -o <this repo>/.github/pathprobe/pathprobe-patches/
+```
+
+Once the changes are in the pathprobe repository, move `PATHPROBE_REF` to
+that commit and delete the files.
 
 ## Image
 
@@ -34,8 +49,8 @@ docker run -d --name pathprobe -e POSTGRES_PASSWORD=postgres -p 5432:5432 \
 
 Tags:
 
-- `<version>-<upstream sha>-pp<pathprobe sha>`, e.g.
-  `20devel-425daf545d91-ppd56ffe5`;
+- `<version>-<upstream sha>-pp<pathprobe sha>[-local<patch series hash>]`,
+  e.g. `20devel-425daf545d91-ppa7f1bd7-local81d819a`;
 - `<version>`, e.g. `20devel`, and `latest`: the most recent build.
 
 The image uses the entrypoint of the official `postgres` image, so

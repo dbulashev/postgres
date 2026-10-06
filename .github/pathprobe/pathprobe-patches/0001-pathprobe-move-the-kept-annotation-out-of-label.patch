@@ -1,0 +1,414 @@
+From 0021469ff46b0bf44f066f043b82231ce73032fa Mon Sep 17 00:00:00 2001
+From: Dmitry Bulashev <d.bulashev@gmail.com>
+Date: Tue, 6 Oct 2026 09:39:50 +0500
+Subject: [PATCH 1/5] pathprobe: move the kept annotation out of label
+
+The probe0 and probe2 survivor snapshots wrote "  kept: startup" and
+"  kept: order?" into the label field, which otherwise names a proposed
+or hypothetical path.  JSON derives origin from label, so a real path
+kept for its startup cost or its order came out as "origin": "proposed"
+with a label, and a tool that filters by origin or label counted it as
+a candidate.
+
+Give the annotation a field of its own, PathEvent.kept ("startup",
+"order?" or NULL).  JSON emits it as "kept"; label is left for
+candidate identity, and real survivors are now "origin": "real".  The
+text output is byte-identical: label and annotation are rendered
+separately instead of relying on the leading spaces of the old label.
+EXPLAIN (FORMAT ...) takes Kept from the new field, so the padding
+strip goes away (and a candidate label is no longer shown as Kept).
+
+The JSON format version goes to 1.2, since origin changes meaning for
+these events; json-format.md lists the changes per version.
+
+New pathprobe_kept slice: on the range + order query of pathprobe.sql
+every annotated survivor is real and has no label, and the labelled
+events of a proposed candidate are still proposed and carry no kept.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Makefile                              |  2 +-
+ README.md                             |  2 +-
+ docs/technical/event-model.md         |  2 ++
+ docs/technical/json-format.md         | 29 +++++++++++++++---
+ docs/technical/output-format-audit.md | 11 +++----
+ docs/user/reading-output.md           |  5 ++++
+ expected/pathprobe_kept.out           | 42 +++++++++++++++++++++++++++
+ pathprobe.c                           | 23 ++++++---------
+ pathprobe.h                           |  3 ++
+ pathprobe_json.c                      |  9 ++++--
+ pathprobe_probe2.c                    |  4 +--
+ sql/pathprobe_kept.sql                | 35 ++++++++++++++++++++++
+ 12 files changed, 138 insertions(+), 29 deletions(-)
+ create mode 100644 expected/pathprobe_kept.out
+ create mode 100644 sql/pathprobe_kept.sql
+
+diff --git a/Makefile b/Makefile
+index 883cdb0..66d1ea6 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@ MODULE_big   = pathprobe
+ OBJS         = pathprobe.o pathprobe_probe1.o pathprobe_probe2.o pathprobe_json.o pathprobe_propose.o pathprobe_advisor.o pathprobe_gate.o pathprobe_security.o
+ EXTENSION    = pathprobe
+ DATA         = pathprobe--1.1.sql
+-REGRESS      = pathprobe pathprobe_propose_basic pathprobe_agent pathprobe_combo pathprobe_combo_generated pathprobe_security pathprobe_lifecycle pathprobe_graph
++REGRESS      = pathprobe pathprobe_propose_basic pathprobe_agent pathprobe_combo pathprobe_combo_generated pathprobe_security pathprobe_lifecycle pathprobe_graph pathprobe_kept
+ PG_CONFIG   ?= pg_config
+ PGXS := $(shell $(PG_CONFIG) --pgxs)
+ PG_CPPFLAGS += -DHAVE_PATHPROBE_HOOKS
+diff --git a/README.md b/README.md
+index 955e7f6..476140a 100644
+--- a/README.md
++++ b/README.md
+@@ -61,7 +61,7 @@ The current line is v1.3 plus the lifecycle work: candidate fates derived
+ only from observed events, explicit coverage, DISPLACED events from
+ `add_path()`, and the fate of hypothetical indexes from the
+ `build_index_paths()` hook.  Extension SQL level 1.1, JSON format version
+-1.1.  Development targets PostgreSQL 20devel (master).
++1.2.  Development targets PostgreSQL 20devel (master).
+ 
+ ## Install
+ 
+diff --git a/docs/technical/event-model.md b/docs/technical/event-model.md
+index c6ea2d1..c3b55eb 100644
+--- a/docs/technical/event-model.md
++++ b/docs/technical/event-model.md
+@@ -28,6 +28,8 @@ pathtype        PostgreSQL path type name
+ kind            excluded/skipped/rejected/accepted/displaced/survived
+ origin          real/proposed
+ label           candidate or hypothetical path identity
++kept            SURVIVED of a real path kept without being the cheapest
++                total: startup or order?
+ path_id         identity of the path within this result (null without a Path)
+ displacer_path_id, displacer_seq, other_pathtype
+                 DISPLACED only: the path that displaced this one, its
+diff --git a/docs/technical/json-format.md b/docs/technical/json-format.md
+index 524376d..4a73343 100644
+--- a/docs/technical/json-format.md
++++ b/docs/technical/json-format.md
+@@ -3,13 +3,14 @@
+ The JSON output is the stable surface for tools and agents.
+ 
+ `version` is the output-format version.  It is not necessarily the package
+-version or the extension SQL version.
++version or the extension SQL version.  Changes between versions are listed
++at the end of this page.
+ 
+ ## Top-level shape
+ 
+ ```json
+ {
+-  "version": "1.1",
++  "version": "1.2",
+   "query": "SELECT ...",
+   "rels": {"1": "t"},
+   "advisor": {},
+@@ -43,6 +44,14 @@ should tolerate empty arrays/objects.
+ }
+ ```
+ 
++A real survivor that is not the cheapest total path carries the reason it
++was kept (see `docs/user/reading-output.md`, "Kept survivors"):
++
++```json
++{"seq": 2, "src": "p0", "rel": "{1}", "pathtype": "IndexScan",
++ "kind": "survived", "path_id": 2, "kept": "startup", "origin": "real"}
++```
++
+ A DISPLACED event also names the path that displaced it:
+ 
+ ```json
+@@ -57,8 +66,10 @@ A DISPLACED event also names the path that displaced it:
+ Rules:
+ 
+ ```text
+-label should be present for proposed/hypothetical/advisor paths
+-origin is real or proposed
++label is set only for proposed/hypothetical/advisor paths
++origin is real or proposed; it is proposed if label is set
++kept is "startup" or "order?" on SURVIVED events (p0, j2) of a real path
++  kept in the pathlist without being the cheapest total; absent otherwise
+ cost fields are omitted when not meaningful or when costs are suppressed
+ strings are JSON-escaped, never interpolated raw
+ path_id is null for skipped and excluded events (no Path exists yet)
+@@ -272,3 +283,13 @@ index_build                            core hooks patch with the index path
+ Summary rows are useful for search-shape analysis.  They should not be used as a
+ replacement for labeled candidate events.  There is no displaced column; count
+ `displaced` events in `events[]`.
++
++## Format versions
++
++```text
++1.2  kept: the survivor annotation moved out of label into its own field;
++     real survivors kept for startup cost or order now have origin "real"
++     (1.1 reported them as "proposed" with label "  kept: ...")
++1.1  first versioned format; path_id, displacer_path_id, displacer_seq and
++     paths[] were added later without a version change
++```
+diff --git a/docs/technical/output-format-audit.md b/docs/technical/output-format-audit.md
+index d8cc2c9..47727fa 100644
+--- a/docs/technical/output-format-audit.md
++++ b/docs/technical/output-format-audit.md
+@@ -36,6 +36,8 @@ but not displacement counts or the build decision.
+   `"label": "  kept: order?"` and therefore `"origin": "proposed"` in JSON
+   (`pathprobe.c` and `pathprobe_probe2.c` reuse the label field for the text
+   annotation).  A tool that filters by `origin` or `label` miscounts.
++  Fixed in JSON format 1.2: the annotation is the `kept` field, and the
++  event is `"origin": "real"`.
+ 
+ ### 2. Displaced paths
+ 
+@@ -162,7 +164,7 @@ unknown / not_examined / not_generated
+ Other findings, outside the list:
+ 
+ ```text
+-A  "kept: ..." stored in label, making origin "proposed"  JSON fix (defect)     follow-up, first
++A  "kept: ..." stored in label, making origin "proposed"  JSON fix (defect)     done (format 1.2)
+ B  empty legacy target/candidate blocks without an        JSON change           follow-up; omit like
+    explicit candidate                                     (removal)             the top-level fate
+ C  advisor block with enabled=false carrying benefit      docs-only             documented (example 8)
+@@ -175,11 +177,10 @@ H  text card "winner" and "note" lines                    text-output only
+ 
+ ## Proposed follow-ups
+ 
+-In order of value.  None is implemented here.
++In order of value.  Items marked done were implemented after the audit.
+ 
+-1. Keep `kept: startup` / `kept: order?` out of `label` (a separate event
+-   field or text-only rendering), so `origin` stays `real` for real paths.
+-   This is a correctness fix for tools that filter by origin or label.
++1. Done: `kept: startup` / `kept: order?` moved out of `label` into the
++   `kept` event field, so `origin` stays `real` for real paths.
+ 2. Done for DISPLACED events (`displacer_path_id`, `displacer_seq`,
+    `other_pathtype`, with `path_id` on every path event and child edges in
+    `paths[]`).  REJECTED events still name no dominator: the core hook
+diff --git a/docs/user/reading-output.md b/docs/user/reading-output.md
+index a73a35a..2252ac7 100644
+--- a/docs/user/reading-output.md
++++ b/docs/user/reading-output.md
+@@ -107,6 +107,11 @@ kept: order?
+ `order?` means the path carries useful ordering information.  It does not prove
+ that a parent node eventually used that order.
+ 
++In JSON the annotation is the `kept` field of the event (`"startup"` or
++`"order?"`); `EXPLAIN (FORMAT JSON)` shows it as `Kept`.  It does not make the
++path a proposed one: `label` and `"origin": "proposed"` are only for proposed
++and hypothetical paths.
++
+ ## Summary rows
+ 
+ The summary is a derived view over events.  It shows search shape.
+diff --git a/expected/pathprobe_kept.out b/expected/pathprobe_kept.out
+new file mode 100644
+index 0000000..6f0bc68
+--- /dev/null
++++ b/expected/pathprobe_kept.out
+@@ -0,0 +1,42 @@
++-- survivor annotations in pathprobe JSON: "kept" is a field of its own;
++-- "label" (and origin "proposed") stays with proposed paths
++SET client_min_messages = warning;
++CREATE EXTENSION IF NOT EXISTS pathprobe;
++RESET client_min_messages;
++SET max_parallel_workers_per_gather = 0;
++CREATE TABLE kp_t (id int, v int);
++INSERT INTO kp_t SELECT g, g % 100 FROM generate_series(1, 2000) g;
++CREATE INDEX kp_t_id ON kp_t (id);
++CREATE INDEX kp_t_v ON kp_t (v);
++ANALYZE kp_t;
++CREATE TABLE kp_p (id int, v int);
++INSERT INTO kp_p SELECT g, g % 100 FROM generate_series(1, 2200) g;
++ANALYZE kp_p;
++-- 1. range + order keeps a non-cheapest survivor (the pathprobe.sql case);
++-- an annotated survivor is a real path and carries no label
++WITH j AS (SELECT pathprobe_json('SELECT * FROM kp_t WHERE v BETWEEN 5 AND 8 ORDER BY v')::jsonb AS j),
++     e AS (SELECT e FROM j, jsonb_array_elements(j->'events') e)
++SELECT (SELECT count(*) > 0 FROM e WHERE e->>'kept' IN ('startup', 'order?')) AS has_kept,
++       (SELECT bool_and(e->>'origin' = 'real' AND NOT e ? 'label') FROM e WHERE e ? 'kept')
++         AS kept_are_real,
++       (SELECT bool_and(e->>'kind' = 'survived') FROM e WHERE e ? 'kept') AS kept_are_survivors,
++       (SELECT bool_and(e->>'origin' = 'real') FROM e) AS no_proposed;
++ has_kept | kept_are_real | kept_are_survivors | no_proposed 
++----------+---------------+--------------------+-------------
++ t        | t             | t                  | t
++(1 row)
++
++-- 2. the labelled events of a proposed candidate are still "proposed"
++WITH j AS (SELECT pathprobe_propose_json(
++             $$ SELECT * FROM kp_p WHERE id = 42 $$,
++             '{"target":{"relname":"kp_p"},"candidate":{"pathname":"c_kept","provider":"t"},"cost":{"total_cost":0.5},"mode":{"winner_forbidden":true}}')::jsonb AS j),
++     e AS (SELECT e FROM j, jsonb_array_elements(j->'events') e)
++SELECT (SELECT count(*) > 0 FROM e WHERE e->>'label' = 'c_kept') AS has_label,
++       (SELECT bool_and(e->>'origin' = 'proposed' AND NOT e ? 'kept') FROM e WHERE e ? 'label')
++         AS labelled_are_proposed;
++ has_label | labelled_are_proposed 
++-----------+-----------------------
++ t         | t
++(1 row)
++
++DROP TABLE kp_t, kp_p;
+diff --git a/pathprobe.c b/pathprobe.c
+index 302a591..85ba445 100644
+--- a/pathprobe.c
++++ b/pathprobe.c
+@@ -699,10 +699,10 @@ probe0_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
+ 
+ 		/* reverse-case annotation (string literals: static lifetime) */
+ 		if (path == cheap_startup && cheap_startup != cheap_total)
+-			ev.label = "  kept: startup";
++			ev.kept = "startup";
+ 		else if (path->param_info == NULL && path != cheap_total &&
+ 				 path->pathkeys != NIL)
+-			ev.label = "  kept: order?";
++			ev.kept = "order?";
+ 
+ 		pelog_append(pathprobe_active_log, &ev);
+ 	}
+@@ -1024,7 +1024,7 @@ render_text(PathProbeReport *report, StringInfo out, PathProbeOpts *opts)
+ 				snprintf(cost_col, sizeof(cost_col), "%10.2f", ev->cost_total);
+ 
+ 			appendStringInfo(out,
+-							 "#%-4d %s  %-12s  %-20s  %s  %-22s  %s%s%s%s%s%s\n",
++							 "#%-4d %s  %-12s  %-20s  %s  %-22s  %s%s%s%s%s%s%s%s\n",
+ 							 ev->seq,
+ 							 src_str,
+ 							 rel_buf,
+@@ -1037,8 +1037,10 @@ render_text(PathProbeReport *report, StringInfo out, PathProbeOpts *opts)
+ 							 : (ev->is_parameterized ? " [param]" : ""),
+ 							 origin_str,
+ 							 (ev->disabled_nodes > 0) ? " disabled" : "",
+-							 (ev->label && ev->label[0] != ' ') ? " " : "",
+-							 ev->label ? ev->label : "");
++							 ev->label ? " " : "",
++							 ev->label ? ev->label : "",
++							 ev->kept ? "  kept: " : "",
++							 ev->kept ? ev->kept : "");
+ 
+ 			/* verbose: competitor name */
+ 			if (opts->verbose && ev->other_pathtype != T_Invalid)
+@@ -1276,15 +1278,8 @@ pathprobe_emit_structured(PathEventLog *log, ExplainState *es)
+ 		}
+ 		if (ev->disabled_nodes > 0)
+ 			ExplainPropertyInteger("Disabled Nodes", NULL, ev->disabled_nodes, es);
+-		if (ev->label)
+-		{
+-			/* strip the "  kept: " text-render padding for the field value */
+-			const char *lbl = ev->label;
+-
+-			while (*lbl == ' ')
+-				lbl++;
+-			ExplainPropertyText("Kept", lbl, es);
+-		}
++		if (ev->kept)
++			ExplainPropertyText("Kept", ev->kept, es);
+ 		ExplainCloseGroup("Path", NULL, true, es);
+ 	}
+ 	ExplainCloseGroup("PathProbe", "PathProbe", false, es);
+diff --git a/pathprobe.h b/pathprobe.h
+index 9f88ead..e41a097 100644
+--- a/pathprobe.h
++++ b/pathprobe.h
+@@ -136,6 +136,9 @@ typedef struct PathEvent
+ 	/* proposed path label (wp, may be NULL)        */
+ 	const char *label;
+ 
++	/* survivor annotation (probe0/probe2): "startup", "order?" or NULL */
++	const char *kept;
++
+ 	/*
+ 	 * Path identity within this log (see pelog_path_id); 0 when the event
+ 	 * has no Path (SKIPPED, EXCLUDED).  For DISPLACED, link_path_id is the
+diff --git a/pathprobe_json.c b/pathprobe_json.c
+index e7298e9..229068c 100644
+--- a/pathprobe_json.c
++++ b/pathprobe_json.c
+@@ -12,7 +12,7 @@
+  *
+  * Output structure:
+  * {
+- *   "version": "1.1",     -- output-format version, NOT the package version
++ *   "version": "1.2",     -- output-format version, NOT the package version
+  *   "rels": {"1": "t", "2": "s"},
+  *   "events": [
+  *     {"seq":1, "src":"p1", "rel":"{1}", "pathtype":"BitmapHeapScan",
+@@ -56,7 +56,7 @@ render_json(PathProbeReport *report, StringInfo out, PathProbeOpts *opts,
+ 	appendStringInfoString(out, "{\n");
+ 
+ 	/* version */
+-	appendStringInfoString(out, "  \"version\": \"1.1\",\n");
++	appendStringInfoString(out, "  \"version\": \"1.2\",\n");
+ 	if (query_string)
+ 	{
+ 		appendStringInfoString(out, "  \"query\": ");
+@@ -187,6 +187,11 @@ render_json(PathProbeReport *report, StringInfo out, PathProbeOpts *opts,
+ 			appendStringInfoString(out, ",\"label\":");
+ 			json_str(out, ev->label);
+ 		}
++		if (ev->kept)
++		{
++			appendStringInfoString(out, ",\"kept\":");
++			json_str(out, ev->kept);
++		}
+ 		appendStringInfo(out, ",\"origin\":\"%s\"",
+ 						 (ev->label != NULL ||
+ 						  ev->source == PATH_SOURCE_PROPOSED) ?
+diff --git a/pathprobe_probe2.c b/pathprobe_probe2.c
+index 4538298..be3b842 100644
+--- a/pathprobe_probe2.c
++++ b/pathprobe_probe2.c
+@@ -180,10 +180,10 @@ probe2_join_pathlist_hook(PlannerInfo *root, RelOptInfo *joinrel,
+ 
+ 		/* reverse-case annotation (string literals: static lifetime) */
+ 		if (path == cheap_startup && cheap_startup != cheap_total)
+-			ev.label = "  kept: startup";
++			ev.kept = "startup";
+ 		else if (path->param_info == NULL && path != cheap_total &&
+ 				 path->pathkeys != NIL)
+-			ev.label = "  kept: order?";
++			ev.kept = "order?";
+ 
+ 		ev.path_id = pelog_path_id(pathprobe_active_log, path);
+ 		pelog_append(pathprobe_active_log, &ev);
+diff --git a/sql/pathprobe_kept.sql b/sql/pathprobe_kept.sql
+new file mode 100644
+index 0000000..a9a17cf
+--- /dev/null
++++ b/sql/pathprobe_kept.sql
+@@ -0,0 +1,35 @@
++-- survivor annotations in pathprobe JSON: "kept" is a field of its own;
++-- "label" (and origin "proposed") stays with proposed paths
++SET client_min_messages = warning;
++CREATE EXTENSION IF NOT EXISTS pathprobe;
++RESET client_min_messages;
++SET max_parallel_workers_per_gather = 0;
++CREATE TABLE kp_t (id int, v int);
++INSERT INTO kp_t SELECT g, g % 100 FROM generate_series(1, 2000) g;
++CREATE INDEX kp_t_id ON kp_t (id);
++CREATE INDEX kp_t_v ON kp_t (v);
++ANALYZE kp_t;
++CREATE TABLE kp_p (id int, v int);
++INSERT INTO kp_p SELECT g, g % 100 FROM generate_series(1, 2200) g;
++ANALYZE kp_p;
++
++-- 1. range + order keeps a non-cheapest survivor (the pathprobe.sql case);
++-- an annotated survivor is a real path and carries no label
++WITH j AS (SELECT pathprobe_json('SELECT * FROM kp_t WHERE v BETWEEN 5 AND 8 ORDER BY v')::jsonb AS j),
++     e AS (SELECT e FROM j, jsonb_array_elements(j->'events') e)
++SELECT (SELECT count(*) > 0 FROM e WHERE e->>'kept' IN ('startup', 'order?')) AS has_kept,
++       (SELECT bool_and(e->>'origin' = 'real' AND NOT e ? 'label') FROM e WHERE e ? 'kept')
++         AS kept_are_real,
++       (SELECT bool_and(e->>'kind' = 'survived') FROM e WHERE e ? 'kept') AS kept_are_survivors,
++       (SELECT bool_and(e->>'origin' = 'real') FROM e) AS no_proposed;
++
++-- 2. the labelled events of a proposed candidate are still "proposed"
++WITH j AS (SELECT pathprobe_propose_json(
++             $$ SELECT * FROM kp_p WHERE id = 42 $$,
++             '{"target":{"relname":"kp_p"},"candidate":{"pathname":"c_kept","provider":"t"},"cost":{"total_cost":0.5},"mode":{"winner_forbidden":true}}')::jsonb AS j),
++     e AS (SELECT e FROM j, jsonb_array_elements(j->'events') e)
++SELECT (SELECT count(*) > 0 FROM e WHERE e->>'label' = 'c_kept') AS has_label,
++       (SELECT bool_and(e->>'origin' = 'proposed' AND NOT e ? 'kept') FROM e WHERE e ? 'label')
++         AS labelled_are_proposed;
++
++DROP TABLE kp_t, kp_p;
+-- 
+2.51.0
+

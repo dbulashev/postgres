@@ -36,10 +36,12 @@ concurrency:
 env:
   PATHPROBE_REPO: obartunov/pathprobe
   # Pinned: the core hooks patch and the extension must come from the same
-  # commit (r2d2/path-graph-json-fixes: kept field, path properties, real
-  # REJECTED dominator).  The jobs after prepare use the resolved sha, so a
-  # branch passed to a manual run cannot move between them.
-  PATHPROBE_REF: ${{ inputs.pathprobe_ref || 'd56ffe5e9f127e4fbd4ad602299b7caff94cfaaf' }}
+  # commit (r2d2/path-graph, a7f1bd7).  The jobs after prepare use the
+  # resolved sha, so a branch passed to a manual run cannot move between
+  # them.  Changes not yet in the pathprobe repository go on top as
+  # format-patch files in .github/pathprobe/pathprobe-patches/ (see
+  # apply-patches.sh); the image tag then carries a hash of that series.
+  PATHPROBE_REF: ${{ inputs.pathprobe_ref || 'a7f1bd7ccd984f77d25ce4a2882f636db3505d59' }}
 
 jobs:
   prepare:
@@ -51,6 +53,8 @@ jobs:
       major: ${{ steps.v.outputs.major }}
       pathprobe: ${{ steps.v.outputs.pathprobe }}
       pathprobe_short: ${{ steps.v.outputs.pathprobe_short }}
+      local_patches: ${{ steps.v.outputs.local_patches }}
+      tag: ${{ steps.v.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -72,6 +76,13 @@ jobs:
           echo "major=$major" >> "$GITHUB_OUTPUT"
           echo "pathprobe=$pp" >> "$GITHUB_OUTPUT"
           echo "pathprobe_short=${pp:0:7}" >> "$GITHUB_OUTPUT"
+          # local pathprobe patches: a short hash of the series, empty if none
+          local=
+          if ls .github/pathprobe/pathprobe-patches/*.patch >/dev/null 2>&1; then
+            local=$(cat .github/pathprobe/pathprobe-patches/*.patch | sha256sum | cut -c1-7)
+          fi
+          echo "local_patches=$local" >> "$GITHUB_OUTPUT"
+          echo "tag=$pg-${base:0:12}-pp${pp:0:7}${local:+-local$local}" >> "$GITHUB_OUTPUT"
 
   # The check the pathprobe README asks for: a patched server with cassert,
   # the extension installed into it, and its regression suite (make
@@ -170,6 +181,7 @@ jobs:
             org.opencontainers.image.description=PostgreSQL ${{ needs.prepare.outputs.pg }} with the pathprobe core hooks and extension
             org.postgresql.upstream.revision=${{ needs.prepare.outputs.base }}
             io.github.obartunov.pathprobe.revision=${{ needs.prepare.outputs.pathprobe }}
+            io.github.obartunov.pathprobe.local-patches=${{ needs.prepare.outputs.local_patches }}
 
       - uses: docker/setup-buildx-action@v4
 
@@ -273,7 +285,7 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=${{ needs.prepare.outputs.pg }}-${{ needs.prepare.outputs.base_short }}-pp${{ needs.prepare.outputs.pathprobe_short }}
+            type=raw,value=${{ needs.prepare.outputs.tag }}
             type=raw,value=${{ needs.prepare.outputs.pg }}
             type=raw,value=latest
 
@@ -295,4 +307,4 @@ jobs:
       - name: Inspect image
         run: |
           docker buildx imagetools inspect \
-            "$IMAGE:${{ needs.prepare.outputs.pg }}-${{ needs.prepare.outputs.base_short }}-pp${{ needs.prepare.outputs.pathprobe_short }}"
+            "$IMAGE:${{ needs.prepare.outputs.tag }}"

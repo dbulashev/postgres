@@ -1,0 +1,505 @@
+From bb4bc99d7055166647a4e9fa6f41e2151154e7b7 Mon Sep 17 00:00:00 2001
+From: Dmitry Bulashev <d.bulashev@gmail.com>
+Date: Tue, 6 Oct 2026 09:46:58 +0500
+Subject: [PATCH 2/5] pathprobe: report startup cost, rows, index and
+ required_outer in JSON
+
+With path_id and paths[] a consumer can build the path graph, but the
+nodes carried only type and relation.  Four facts that decide or
+explain a planner choice were missing: the startup cost (a path more
+expensive in total can displace another on startup), the row estimate,
+the index an index path scans (ambiguous once a table has several),
+and the rels a parameterized path depends on (only a boolean so far).
+
+Costs stay on events, and cost_startup joins cost_total.  Rows,
+required_outer and the index are properties of a Path that do not
+change after it is built, so they go on its paths[] node and are read
+when the node is registered, while the Path is live.  SKIPPED events
+have no Path; the precheck hook passes required_outer, which is
+interned (the caller frees it after the hook) and emitted on the
+event.
+
+The index name is looked up at render time.  A pathprobe hypothetical
+index has a fake oid from 0x7FFF0000 up, without a catalog entry, and
+the number may be a real relation's oid after oid wraparound, so the
+node records IndexOptInfo.hypothetical and reports
+"index_hypothetical": true instead of an oid and a name; its events
+keep the hypo:<name> label.
+
+pathprobe_graph checks the new fields structurally: the inner index
+paths name an index of gr_o (gr_o_customer_idx among them), index_oid
+and index agree, other paths have none, required_outer is the other
+rel and matches the param flag, rows are positive, startup does not
+exceed total; and a hypothetical index path reports neither oid nor
+name but carries its label.  No cost or row values are asserted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/technical/event-model.md         |  4 +-
+ docs/technical/implementation.md      |  6 ++-
+ docs/technical/json-format.md         | 39 ++++++++++++++++++-
+ docs/technical/output-format-audit.md |  6 +++
+ docs/user/reading-output.md           |  5 ++-
+ expected/pathprobe_graph.out          | 56 ++++++++++++++++++++++++++-
+ pathprobe.c                           | 24 ++++++++++++
+ pathprobe.h                           | 10 ++++-
+ pathprobe_json.c                      | 35 +++++++++++++++++
+ pathprobe_probe1.c                    |  3 ++
+ sql/pathprobe_graph.sql               | 48 ++++++++++++++++++++++-
+ 11 files changed, 224 insertions(+), 12 deletions(-)
+
+diff --git a/docs/technical/event-model.md b/docs/technical/event-model.md
+index c3b55eb..397ad74 100644
+--- a/docs/technical/event-model.md
++++ b/docs/technical/event-model.md
+@@ -34,7 +34,9 @@ path_id         identity of the path within this result (null without a Path)
+ displacer_path_id, displacer_seq, other_pathtype
+                 DISPLACED only: the path that displaced this one, its
+                 ACCEPTED event and its type
+-cost_total      path total cost where meaningful
++cost_startup, cost_total
++                path costs where meaningful
++required_outer  SKIPPED only: rels the join would be parameterized by
+ gap_cost        difference from local competitor where meaningful
+ skip_reason     precheck reason where available
+ disabled_nodes  planner disabled-nodes marker
+diff --git a/docs/technical/implementation.md b/docs/technical/implementation.md
+index 88eacb4..b5fa32d 100644
+--- a/docs/technical/implementation.md
++++ b/docs/technical/implementation.md
+@@ -96,8 +96,10 @@ PathProbeReport   log + summary + advisor fields returned to the renderers
+ ```
+ 
+ Path identity (`pelog_path_id`, pathprobe.c): a hash map from Path pointer
+-to a per-log id, plus a node table (`PathNode`: type, relids, child edges)
+-that the JSON renderer emits as `paths[]`.  Children of join and
++to a per-log id, plus a node table (`PathNode`: type, relids, child edges,
++rows, required_outer, index) that the JSON renderer emits as `paths[]`.  The
++properties are read when the node is registered, while the Path is live;
++the index name is looked up at render time.  Children of join and
+ single-input wrapper paths are registered with their parent.  The probe1
+ hooks call `pelog_path_forget` for every path `add_path()` is about to free,
+ also when acceptance is not logged, so a recycled address gets a new id.
+diff --git a/docs/technical/json-format.md b/docs/technical/json-format.md
+index 4a73343..65b587f 100644
+--- a/docs/technical/json-format.md
++++ b/docs/technical/json-format.md
+@@ -39,11 +39,20 @@ should tolerate empty arrays/objects.
+   "origin": "proposed",
+   "label": "candidate_name",
+   "path_id": 4,
++  "cost_startup": 0.0,
+   "cost_total": 1.0,
+   "disabled_nodes": 1
+ }
+ ```
+ 
++A SKIPPED event has no Path, so its parameterization is on the event:
++
++```json
++{"seq": 7, "src": "pc", "rel": "{1,2}", "pathtype": "NestLoop",
++ "cost_startup": 0.29, "cost_total": 41.7, "kind": "skipped", "path_id": null,
++ "skip_reason": "dominated_early", "required_outer": "{3}", "param": true}
++```
++
+ A real survivor that is not the cheapest total path carries the reason it
+ was kept (see `docs/user/reading-output.md`, "Kept survivors"):
+ 
+@@ -73,6 +82,10 @@ kept is "startup" or "order?" on SURVIVED events (p0, j2) of a real path
+ cost fields are omitted when not meaningful or when costs are suppressed
+ strings are JSON-escaped, never interpolated raw
+ path_id is null for skipped and excluded events (no Path exists yet)
++cost_startup and cost_total are the path's costs at the event; for skipped
++  events, the lower bounds precheck compared
++required_outer is on skipped events only, when non-empty; for other events
++  it is a property of the path, in paths[]
+ displacer_seq is null if the displacer's ACCEPTED event was not recorded
+   (event cap)
+ ```
+@@ -85,8 +98,28 @@ or Material path built inside a nested loop).
+ 
+ ```json
+ {"path_id": 12, "pathtype": "NestLoop", "rel": "{1,2}",
+- "outer_path_id": 2, "inner_path_id": 9}
+-{"path_id": 9, "pathtype": "BitmapHeapScan", "rel": "{2}", "subpath_id": 8}
++ "outer_path_id": 2, "inner_path_id": 9, "rows": 15}
++{"path_id": 9, "pathtype": "BitmapHeapScan", "rel": "{2}", "subpath_id": 8,
++ "rows": 3, "required_outer": "{1}", "index_oid": 16403,
++ "index": "orders_customer_idx"}
++```
++
++Besides the edges below, a node carries the properties that do not change
++after a Path is built:
++
++```text
++rows                the path's row estimate (per loop for a parameterized
++                    path); always present
++required_outer      the rels the path is parameterized by, as "{1}";
++                    omitted when the path is not parameterized
++index_oid, index    IndexScan and IndexOnlyScan, and a BitmapHeapScan over
++                    a single index: the index oid and its name; omitted for
++                    other paths, for a BitmapHeapScan over BitmapAnd /
++                    BitmapOr, and the name alone if the index is gone
++index_hypothetical  true instead of index_oid and index when the index is a
++                    pathprobe hypothetical index: its oid is a fake one with
++                    no catalog entry and may equal a real relation's oid;
++                    the hypo:<name> label of the path's events names it
+ ```
+ 
+ ```text
+@@ -290,6 +323,8 @@ replacement for labeled candidate events.  There is no displaced column; count
+ 1.2  kept: the survivor annotation moved out of label into its own field;
+      real survivors kept for startup cost or order now have origin "real"
+      (1.1 reported them as "proposed" with label "  kept: ...")
++     cost_startup on events, required_outer on skipped events; rows,
++     required_outer, index_oid, index and index_hypothetical in paths[]
+ 1.1  first versioned format; path_id, displacer_path_id, displacer_seq and
+      paths[] were added later without a version change
+ ```
+diff --git a/docs/technical/output-format-audit.md b/docs/technical/output-format-audit.md
+index 47727fa..9ebccd7 100644
+--- a/docs/technical/output-format-audit.md
++++ b/docs/technical/output-format-audit.md
+@@ -190,6 +190,12 @@ In order of value.  Items marked done were implemented after the audit.
+    explicit candidate, as already done for the top-level `fate`.
+ 5. Mark the source of each hypothetical index (`advisor` or `user`).
+ 
++Added after the audit, outside the list: the properties a plan view needs
++next to the graph.  Events carry `cost_startup`; SKIPPED events carry
++`required_outer`; `paths[]` nodes carry `rows`, `required_outer` and the
++index of an index path (`index_oid`, `index`, or `index_hypothetical`).
++See `json-format.md`.
++
+ ## jq recipes
+ 
+ Per hypothetical index lifecycle:
+diff --git a/docs/user/reading-output.md b/docs/user/reading-output.md
+index 2252ac7..017a0cf 100644
+--- a/docs/user/reading-output.md
++++ b/docs/user/reading-output.md
+@@ -59,8 +59,9 @@ it across its events (accepted, survived in a snapshot, displaced).  A
+ DISPLACED event names its displacer (`displacer_path_id`, `displacer_seq`,
+ `other_pathtype`).  The top-level `paths[]` array gives each id its type and
+ relation, and the child edges of join paths (`outer_path_id`,
+-`inner_path_id`) and single-input wrappers (`subpath_id`).  `seq` is event
+-order, not identity.  See
++`inner_path_id`) and single-input wrappers (`subpath_id`), with the row
++estimate, the parameterization (`required_outer`) and, for index paths, the
++index.  `seq` is event order, not identity.  See
+ [json-format](../technical/json-format.md#path-identity-and-graph-edges).
+ 
+ ## Sources
+diff --git a/expected/pathprobe_graph.out b/expected/pathprobe_graph.out
+index 5e15231..36d0143 100644
+--- a/expected/pathprobe_graph.out
++++ b/expected/pathprobe_graph.out
+@@ -17,13 +17,18 @@ SELECT (e->>'seq')::int AS seq, e->>'kind' AS kind, e->>'rel' AS rel,
+        e->>'pathtype' AS pathtype, (e->>'path_id')::int AS path_id,
+        (e->>'displacer_path_id')::int AS displacer_path_id,
+        (e->>'displacer_seq')::int AS displacer_seq,
+-       e->>'other_pathtype' AS other_pathtype
++       e->>'other_pathtype' AS other_pathtype,
++       (e->>'cost_startup')::float8 AS cost_startup,
++       (e->>'cost_total')::float8 AS cost_total,
++       coalesce((e->>'param')::bool, false) AS param
+ FROM gr_j, jsonb_array_elements(j->'events') e;
+ CREATE TEMP VIEW gr_paths AS
+ SELECT (p->>'path_id')::int AS path_id, p->>'pathtype' AS pathtype,
+        p->>'rel' AS rel, (p->>'subpath_id')::int AS subpath_id,
+        (p->>'outer_path_id')::int AS outer_path_id,
+-       (p->>'inner_path_id')::int AS inner_path_id
++       (p->>'inner_path_id')::int AS inner_path_id,
++       (p->>'rows')::float8 AS rows, p->>'required_outer' AS required_outer,
++       (p->>'index_oid')::oid AS index_oid, p->>'index' AS index
+ FROM gr_j, jsonb_array_elements(j->'paths') p;
+ -- 1. every DISPLACED event names the displaced path (an earlier ACCEPTED
+ -- path_id) and the displacing path (the path_id of the ACCEPTED event at
+@@ -125,4 +130,51 @@ FROM j;
+ (1 row)
+ 
+ RESET pathprobe.log_accepted;
++-- 6. path properties: the index of an index path, required_outer of a
++-- parameterized one, rows on every node, startup cost on every event
++SELECT
++  (SELECT bool_and(index IN (SELECT indexrelid::regclass::text FROM pg_index
++                             WHERE indrelid = 'gr_o'::regclass))
++          AND bool_or(index = 'gr_o_customer_idx')
++   FROM gr_paths
++   WHERE rel = '{2}' AND pathtype IN ('IndexScan', 'IndexOnlyScan', 'BitmapHeapScan'))
++    AS inner_index_named,
++  (SELECT bool_and(index IS NOT NULL AND index_oid::regclass::text = index)
++   FROM gr_paths WHERE pathtype IN ('IndexScan', 'IndexOnlyScan'))
++    AS index_paths_have_index,
++  (SELECT bool_and(index IS NULL AND index_oid IS NULL)
++   FROM gr_paths WHERE pathtype NOT IN ('IndexScan', 'IndexOnlyScan', 'BitmapHeapScan'))
++    AS others_have_none,
++  (SELECT bool_and((rel = '{1}' AND required_outer = '{2}') OR
++                   (rel = '{2}' AND required_outer = '{1}'))
++          AND bool_or(rel = '{2}')
++   FROM gr_paths WHERE required_outer IS NOT NULL)
++    AS required_outer_is_other_rel,
++  (SELECT bool_and(e.param = (p.required_outer IS NOT NULL))
++   FROM gr_ev e JOIN gr_paths p USING (path_id))
++    AS param_matches_required_outer,
++  (SELECT bool_and(rows > 0) FROM gr_paths) AS rows_positive,
++  (SELECT bool_and(cost_startup IS NOT NULL AND cost_startup <= cost_total) FROM gr_ev)
++    AS startup_le_total;
++ inner_index_named | index_paths_have_index | others_have_none | required_outer_is_other_rel | param_matches_required_outer | rows_positive | startup_le_total 
++-------------------+------------------------+------------------+-----------------------------+------------------------------+---------------+------------------
++ t                 | t                      | t                | t                           | t                            | t             | t
++(1 row)
++
++-- 7. a path over a hypothetical index names no index: its fake oid has no
++-- catalog entry; the hypo: label of its events identifies it
++WITH j AS (SELECT pathprobe_propose_json('SELECT * FROM gr_o WHERE amount = 5',
++             '{"hypo_indexes":[{"relname":"gr_o","columns":["amount"],"name":"gr_hypo"}]}')::jsonb AS j),
++     p AS (SELECT p FROM j, jsonb_array_elements(j->'paths') p
++           WHERE (p->>'index_hypothetical')::bool),
++     e AS (SELECT e FROM j, jsonb_array_elements(j->'events') e)
++SELECT (SELECT count(*) > 0 FROM p) AS has_hypo_path,
++       (SELECT bool_and(NOT p.p ? 'index_oid' AND NOT p.p ? 'index') FROM p) AS no_oid_no_name,
++       (SELECT bool_or(e.e->>'label' = 'hypo:gr_hypo')
++        FROM e JOIN p ON e.e->'path_id' = p.p->'path_id') AS labelled;
++ has_hypo_path | no_oid_no_name | labelled 
++---------------+----------------+----------
++ t             | t              | t
++(1 row)
++
+ DROP TABLE gr_o, gr_c;
+diff --git a/pathprobe.c b/pathprobe.c
+index 85ba445..5fb9a0d 100644
+--- a/pathprobe.c
++++ b/pathprobe.c
+@@ -437,6 +437,23 @@ path_single_input(Path *path)
+ 	}
+ }
+ 
++/*
++ * the index an index path scans: IndexScan and IndexOnlyScan, or a
++ * BitmapHeapScan over a single index; NULL for BitmapAnd / BitmapOr (several
++ * indexes) and other paths
++ */
++static const IndexOptInfo *
++path_index(const Path *path)
++{
++	if (path == NULL)
++		return NULL;
++	if (IsA(path, IndexPath))
++		return ((const IndexPath *) path)->indexinfo;
++	if (IsA(path, BitmapHeapPath))
++		return path_index(((const BitmapHeapPath *) path)->bitmapqual);
++	return NULL;
++}
++
+ static int
+ pelog_register_path(PathEventLog *log, Path *path)
+ {
+@@ -448,6 +465,7 @@ pelog_register_path(PathEventLog *log, Path *path)
+ 				outer = 0,
+ 				inner = 0;
+ 	Path	   *child;
++	const IndexOptInfo *index;
+ 
+ 	if (path == NULL)
+ 		return 0;
+@@ -500,6 +518,12 @@ pelog_register_path(PathEventLog *log, Path *path)
+ 	log->nodes[idx].subpath_id = sub;
+ 	log->nodes[idx].outer_path_id = outer;
+ 	log->nodes[idx].inner_path_id = inner;
++	log->nodes[idx].rows = path->rows;
++	log->nodes[idx].required_outer =
++		pelog_intern_relids(log, PATH_REQ_OUTER(path));
++	index = path_index(path);
++	log->nodes[idx].index_oid = index ? index->indexoid : InvalidOid;
++	log->nodes[idx].index_hypothetical = index ? index->hypothetical : false;
+ 	return id;
+ }
+ 
+diff --git a/pathprobe.h b/pathprobe.h
+index e41a097..1c4072d 100644
+--- a/pathprobe.h
++++ b/pathprobe.h
+@@ -132,6 +132,7 @@ typedef struct PathEvent
+ 
+ 	/* precheck context (PEK_SKIPPED only) */
+ 	int			skip_reason;	/* PathSkipReason - why precheck rejected */
++	Relids		required_outer; /* interned; NULL if unparameterized */
+ 
+ 	/* proposed path label (wp, may be NULL)        */
+ 	const char *label;
+@@ -153,7 +154,9 @@ typedef struct PathEvent
+ /*
+  * PathNode - one Path seen during the probe, by id.  Edges to child paths
+  * are recorded when the node is first registered; a child that never had
+- * an event of its own still gets a node.  0 means no such edge.
++ * an event of its own still gets a node.  0 means no such edge.  The other
++ * properties do not change after a Path is built and are read at the same
++ * time, while the Path is live.
+  */
+ typedef struct PathNode
+ {
+@@ -163,6 +166,11 @@ typedef struct PathNode
+ 	int			subpath_id;		/* single-input wrapper, BitmapHeapScan */
+ 	int			outer_path_id;	/* join paths */
+ 	int			inner_path_id;
++	double		rows;			/* path->rows */
++	Relids		required_outer; /* interned; NULL if unparameterized */
++	Oid			index_oid;		/* index scans, BitmapHeapScan over one
++								 * index; InvalidOid otherwise */
++	bool		index_hypothetical; /* index_oid is a pathprobe fake oid */
+ } PathNode;
+ 
+ /* ----------
+diff --git a/pathprobe_json.c b/pathprobe_json.c
+index 229068c..50d4167 100644
+--- a/pathprobe_json.c
++++ b/pathprobe_json.c
+@@ -33,6 +33,7 @@
+ #include "lib/stringinfo.h"
+ #include "nodes/bitmapset.h"
+ #include "utils/builtins.h"
++#include "utils/lsyscache.h"
+ #include "utils/memutils.h"
+ 
+ #include "pathprobe.h"
+@@ -161,6 +162,7 @@ render_json(PathProbeReport *report, StringInfo out, PathProbeOpts *opts,
+ 		json_str(out, rel_buf);
+ 		appendStringInfoString(out, ",\"pathtype\":");
+ 		json_str(out, pathtype_name(ev->pathtype));
++		appendStringInfo(out, ",\"cost_startup\":%.2f", ev->cost_startup);
+ 		appendStringInfo(out, ",\"cost_total\":%.2f", ev->cost_total);
+ 		appendStringInfoString(out, ",\"kind\":");
+ 		json_str(out, kind_str);
+@@ -209,6 +211,12 @@ render_json(PathProbeReport *report, StringInfo out, PathProbeOpts *opts,
+ 
+ 			appendStringInfoString(out, ",\"skip_reason\":");
+ 			json_str(out, reason);
++			if (ev->required_outer)
++			{
++				relids_to_str(ev->required_outer, rel_buf, sizeof(rel_buf));
++				appendStringInfoString(out, ",\"required_outer\":");
++				json_str(out, rel_buf);
++			}
+ 		}
+ 
+ 		if (ev->is_parameterized)
+@@ -243,6 +251,33 @@ render_json(PathProbeReport *report, StringInfo out, PathProbeOpts *opts,
+ 			appendStringInfo(out, ",\"outer_path_id\":%d", n->outer_path_id);
+ 		if (n->inner_path_id > 0)
+ 			appendStringInfo(out, ",\"inner_path_id\":%d", n->inner_path_id);
++		appendStringInfo(out, ",\"rows\":%.0f", n->rows);
++		if (n->required_outer)
++		{
++			relids_to_str(n->required_outer, rel_buf, sizeof(rel_buf));
++			appendStringInfoString(out, ",\"required_outer\":");
++			json_str(out, rel_buf);
++		}
++
++		/*
++		 * A hypothetical index has a fake oid without a catalog entry, and
++		 * the number may belong to a real relation: report neither.  Its
++		 * path is identified by the hypo:<name> label of its events.
++		 */
++		if (n->index_hypothetical)
++			appendStringInfoString(out, ",\"index_hypothetical\":true");
++		else if (OidIsValid(n->index_oid))
++		{
++			char	   *iname = get_rel_name(n->index_oid);
++
++			appendStringInfo(out, ",\"index_oid\":%u", n->index_oid);
++			if (iname)
++			{
++				appendStringInfoString(out, ",\"index\":");
++				json_str(out, iname);
++				pfree(iname);
++			}
++		}
+ 		appendStringInfoChar(out, '}');
+ 	}
+ 	appendStringInfoString(out, log->nnodes > 0 ? "\n  ],\n" : "],\n");
+diff --git a/pathprobe_probe1.c b/pathprobe_probe1.c
+index 5cf0541..0aaff49 100644
+--- a/pathprobe_probe1.c
++++ b/pathprobe_probe1.c
+@@ -245,6 +245,9 @@ probe_skipped_hook(RelOptInfo *joinrel, NodeTag join_pathtype,
+ 	ev.origin = PATH_ORIGIN_REAL;
+ 	ev.source = PATH_SOURCE_PRECHECK;
+ 	ev.is_parameterized = (required_outer != NULL && !bms_is_empty(required_outer));
++	/* the caller frees required_outer right after this hook: intern a copy */
++	ev.required_outer = pelog_intern_relids(pathprobe_active_log,
++											required_outer);
+ 	ev.cost_startup = startup_cost;
+ 	ev.cost_total = total_cost;
+ 	ev.disabled_nodes = disabled_nodes;
+diff --git a/sql/pathprobe_graph.sql b/sql/pathprobe_graph.sql
+index c62c35f..2c9bcd7 100644
+--- a/sql/pathprobe_graph.sql
++++ b/sql/pathprobe_graph.sql
+@@ -18,13 +18,18 @@ SELECT (e->>'seq')::int AS seq, e->>'kind' AS kind, e->>'rel' AS rel,
+        e->>'pathtype' AS pathtype, (e->>'path_id')::int AS path_id,
+        (e->>'displacer_path_id')::int AS displacer_path_id,
+        (e->>'displacer_seq')::int AS displacer_seq,
+-       e->>'other_pathtype' AS other_pathtype
++       e->>'other_pathtype' AS other_pathtype,
++       (e->>'cost_startup')::float8 AS cost_startup,
++       (e->>'cost_total')::float8 AS cost_total,
++       coalesce((e->>'param')::bool, false) AS param
+ FROM gr_j, jsonb_array_elements(j->'events') e;
+ CREATE TEMP VIEW gr_paths AS
+ SELECT (p->>'path_id')::int AS path_id, p->>'pathtype' AS pathtype,
+        p->>'rel' AS rel, (p->>'subpath_id')::int AS subpath_id,
+        (p->>'outer_path_id')::int AS outer_path_id,
+-       (p->>'inner_path_id')::int AS inner_path_id
++       (p->>'inner_path_id')::int AS inner_path_id,
++       (p->>'rows')::float8 AS rows, p->>'required_outer' AS required_outer,
++       (p->>'index_oid')::oid AS index_oid, p->>'index' AS index
+ FROM gr_j, jsonb_array_elements(j->'paths') p;
+ 
+ -- 1. every DISPLACED event names the displaced path (an earlier ACCEPTED
+@@ -94,4 +99,43 @@ SELECT (SELECT count(*) FROM j, jsonb_array_elements(j->'events') e WHERE e->>'k
+ FROM j;
+ RESET pathprobe.log_accepted;
+ 
++-- 6. path properties: the index of an index path, required_outer of a
++-- parameterized one, rows on every node, startup cost on every event
++SELECT
++  (SELECT bool_and(index IN (SELECT indexrelid::regclass::text FROM pg_index
++                             WHERE indrelid = 'gr_o'::regclass))
++          AND bool_or(index = 'gr_o_customer_idx')
++   FROM gr_paths
++   WHERE rel = '{2}' AND pathtype IN ('IndexScan', 'IndexOnlyScan', 'BitmapHeapScan'))
++    AS inner_index_named,
++  (SELECT bool_and(index IS NOT NULL AND index_oid::regclass::text = index)
++   FROM gr_paths WHERE pathtype IN ('IndexScan', 'IndexOnlyScan'))
++    AS index_paths_have_index,
++  (SELECT bool_and(index IS NULL AND index_oid IS NULL)
++   FROM gr_paths WHERE pathtype NOT IN ('IndexScan', 'IndexOnlyScan', 'BitmapHeapScan'))
++    AS others_have_none,
++  (SELECT bool_and((rel = '{1}' AND required_outer = '{2}') OR
++                   (rel = '{2}' AND required_outer = '{1}'))
++          AND bool_or(rel = '{2}')
++   FROM gr_paths WHERE required_outer IS NOT NULL)
++    AS required_outer_is_other_rel,
++  (SELECT bool_and(e.param = (p.required_outer IS NOT NULL))
++   FROM gr_ev e JOIN gr_paths p USING (path_id))
++    AS param_matches_required_outer,
++  (SELECT bool_and(rows > 0) FROM gr_paths) AS rows_positive,
++  (SELECT bool_and(cost_startup IS NOT NULL AND cost_startup <= cost_total) FROM gr_ev)
++    AS startup_le_total;
++
++-- 7. a path over a hypothetical index names no index: its fake oid has no
++-- catalog entry; the hypo: label of its events identifies it
++WITH j AS (SELECT pathprobe_propose_json('SELECT * FROM gr_o WHERE amount = 5',
++             '{"hypo_indexes":[{"relname":"gr_o","columns":["amount"],"name":"gr_hypo"}]}')::jsonb AS j),
++     p AS (SELECT p FROM j, jsonb_array_elements(j->'paths') p
++           WHERE (p->>'index_hypothetical')::bool),
++     e AS (SELECT e FROM j, jsonb_array_elements(j->'events') e)
++SELECT (SELECT count(*) > 0 FROM p) AS has_hypo_path,
++       (SELECT bool_and(NOT p.p ? 'index_oid' AND NOT p.p ? 'index') FROM p) AS no_oid_no_name,
++       (SELECT bool_or(e.e->>'label' = 'hypo:gr_hypo')
++        FROM e JOIN p ON e.e->'path_id' = p.p->'path_id') AS labelled;
++
+ DROP TABLE gr_o, gr_c;
+-- 
+2.51.0
+

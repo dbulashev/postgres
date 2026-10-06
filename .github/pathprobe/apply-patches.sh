@@ -7,6 +7,11 @@
 # checkout (patches/pathprobe-core-hooks.patch), so the hooks and the
 # extension built against them always come from the same pathprobe commit.
 #
+# Local pathprobe changes: if .github/pathprobe/pathprobe-patches/ holds
+# format-patch files, they are applied to the pathprobe checkout first, with
+# git am, so that changes not yet in the pathprobe repository can be built and
+# tested.  They come before the core hooks patch because they may change it.
+#
 # Prints the upstream commit the patch was applied to: the most recent commit
 # that changes anything outside .github/.  The CI scaffolding on this branch
 # lives entirely under .github/, so its commits are skipped whatever their
@@ -37,6 +42,12 @@ if $base_only; then
 fi
 
 src=${1:?usage: apply-patches.sh [--base-only] <pathprobe checkout>}
+
+set -- "$top"/.github/pathprobe/pathprobe-patches/*.patch
+if [ -e "$1" ]; then
+	git -C "$src" -c user.name=ci -c user.email=ci@localhost am "$@" >&2
+fi
+
 patch="$src/patches/pathprobe-core-hooks.patch"
 
 # The patch is a plain diff, not a format-patch series: apply it to the

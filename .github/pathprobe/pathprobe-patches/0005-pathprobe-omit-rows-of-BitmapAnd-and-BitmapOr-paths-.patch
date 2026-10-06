@@ -1,0 +1,130 @@
+From d56ffe5e9f127e4fbd4ad602299b7caff94cfaaf Mon Sep 17 00:00:00 2001
+From: Dmitry Bulashev <d.bulashev@gmail.com>
+Date: Tue, 6 Oct 2026 10:09:51 +0500
+Subject: [PATCH 5/5] pathprobe: omit rows of BitmapAnd and BitmapOr paths in
+ paths[]
+
+The planner leaves path.rows of these at 0, "not used" (costsize.c), so
+the JSON reported an estimate of 0 rows that was never made.  Omit the
+field for them, document that rows can still be 0 for a relation proven
+empty, and make the graph test assert both.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/technical/json-format.md | 4 +++-
+ expected/pathprobe_graph.out  | 6 ++++--
+ pathprobe.c                   | 4 +++-
+ pathprobe.h                   | 3 ++-
+ pathprobe_json.c              | 3 ++-
+ sql/pathprobe_graph.sql       | 6 ++++--
+ 6 files changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/docs/technical/json-format.md b/docs/technical/json-format.md
+index ab6250a..129a3ba 100644
+--- a/docs/technical/json-format.md
++++ b/docs/technical/json-format.md
+@@ -132,7 +132,9 @@ after a Path is built:
+ 
+ ```text
+ rows                the path's row estimate (per loop for a parameterized
+-                    path); always present
++                    path); omitted for BitmapAnd and BitmapOr, where the
++                    planner does not set it; can be 0 for a relation the
++                    planner proved empty
+ required_outer      the rels the path is parameterized by, as "{1}";
+                     omitted when the path is not parameterized
+ index_oid, index    IndexScan and IndexOnlyScan, and a BitmapHeapScan over
+diff --git a/expected/pathprobe_graph.out b/expected/pathprobe_graph.out
+index c8ee5f2..a5cdfbf 100644
+--- a/expected/pathprobe_graph.out
++++ b/expected/pathprobe_graph.out
+@@ -132,7 +132,8 @@ FROM j;
+ 
+ RESET pathprobe.log_accepted;
+ -- 6. path properties: the index of an index path, required_outer of a
+--- parameterized one, rows on every node, startup cost on every event
++-- parameterized one, rows on every node but BitmapAnd / BitmapOr (the
++-- planner does not set them), startup cost on every event
+ SELECT
+   (SELECT bool_and(index IN (SELECT indexrelid::regclass::text FROM pg_index
+                              WHERE indrelid = 'gr_o'::regclass))
+@@ -154,7 +155,8 @@ SELECT
+   (SELECT bool_and(e.param = (p.required_outer IS NOT NULL))
+    FROM gr_ev e JOIN gr_paths p USING (path_id))
+     AS param_matches_required_outer,
+-  (SELECT bool_and(rows > 0) FROM gr_paths) AS rows_positive,
++  (SELECT bool_and(CASE WHEN pathtype IN ('BitmapAnd', 'BitmapOr') THEN rows IS NULL
++                        ELSE rows > 0 END) FROM gr_paths) AS rows_positive,
+   (SELECT bool_and(cost_startup IS NOT NULL AND cost_startup <= cost_total) FROM gr_ev)
+     AS startup_le_total;
+  inner_index_named | index_paths_have_index | others_have_none | required_outer_is_other_rel | param_matches_required_outer | rows_positive | startup_le_total 
+diff --git a/pathprobe.c b/pathprobe.c
+index 60a12ba..87199ee 100644
+--- a/pathprobe.c
++++ b/pathprobe.c
+@@ -521,7 +521,9 @@ pelog_register_path(PathEventLog *log, Path *path)
+ 	log->nodes[idx].subpath_id = sub;
+ 	log->nodes[idx].outer_path_id = outer;
+ 	log->nodes[idx].inner_path_id = inner;
+-	log->nodes[idx].rows = path->rows;
++	/* BitmapAnd and BitmapOr leave rows at 0, "not used" (costsize.c) */
++	log->nodes[idx].rows =
++		(IsA(path, BitmapAndPath) || IsA(path, BitmapOrPath)) ? -1 : path->rows;
+ 	log->nodes[idx].required_outer =
+ 		pelog_intern_relids(log, PATH_REQ_OUTER(path));
+ 	index = path_index(path);
+diff --git a/pathprobe.h b/pathprobe.h
+index 7a3ecf8..c48aeda 100644
+--- a/pathprobe.h
++++ b/pathprobe.h
+@@ -170,7 +170,8 @@ typedef struct PathNode
+ 	int			subpath_id;		/* single-input wrapper, BitmapHeapScan */
+ 	int			outer_path_id;	/* join paths */
+ 	int			inner_path_id;
+-	double		rows;			/* path->rows */
++	double		rows;			/* path->rows; -1 where the planner does not
++								 * set it (BitmapAnd, BitmapOr) */
+ 	Relids		required_outer; /* interned; NULL if unparameterized */
+ 	Oid			index_oid;		/* index scans, BitmapHeapScan over one
+ 								 * index; InvalidOid otherwise */
+diff --git a/pathprobe_json.c b/pathprobe_json.c
+index f8f302b..4a54c91 100644
+--- a/pathprobe_json.c
++++ b/pathprobe_json.c
+@@ -268,7 +268,8 @@ render_json(PathProbeReport *report, StringInfo out, PathProbeOpts *opts,
+ 			appendStringInfo(out, ",\"outer_path_id\":%d", n->outer_path_id);
+ 		if (n->inner_path_id > 0)
+ 			appendStringInfo(out, ",\"inner_path_id\":%d", n->inner_path_id);
+-		appendStringInfo(out, ",\"rows\":%.0f", n->rows);
++		if (n->rows >= 0)
++			appendStringInfo(out, ",\"rows\":%.0f", n->rows);
+ 		if (n->required_outer)
+ 		{
+ 			relids_to_str(n->required_outer, rel_buf, sizeof(rel_buf));
+diff --git a/sql/pathprobe_graph.sql b/sql/pathprobe_graph.sql
+index da428ad..8b069a9 100644
+--- a/sql/pathprobe_graph.sql
++++ b/sql/pathprobe_graph.sql
+@@ -101,7 +101,8 @@ FROM j;
+ RESET pathprobe.log_accepted;
+ 
+ -- 6. path properties: the index of an index path, required_outer of a
+--- parameterized one, rows on every node, startup cost on every event
++-- parameterized one, rows on every node but BitmapAnd / BitmapOr (the
++-- planner does not set them), startup cost on every event
+ SELECT
+   (SELECT bool_and(index IN (SELECT indexrelid::regclass::text FROM pg_index
+                              WHERE indrelid = 'gr_o'::regclass))
+@@ -123,7 +124,8 @@ SELECT
+   (SELECT bool_and(e.param = (p.required_outer IS NOT NULL))
+    FROM gr_ev e JOIN gr_paths p USING (path_id))
+     AS param_matches_required_outer,
+-  (SELECT bool_and(rows > 0) FROM gr_paths) AS rows_positive,
++  (SELECT bool_and(CASE WHEN pathtype IN ('BitmapAnd', 'BitmapOr') THEN rows IS NULL
++                        ELSE rows > 0 END) FROM gr_paths) AS rows_positive,
+   (SELECT bool_and(cost_startup IS NOT NULL AND cost_startup <= cost_total) FROM gr_ev)
+     AS startup_le_total;
+ 
+-- 
+2.51.0
+
