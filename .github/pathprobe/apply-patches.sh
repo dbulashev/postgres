@@ -7,10 +7,10 @@
 # checkout (patches/pathprobe-core-hooks.patch), so the hooks and the
 # extension built against them always come from the same pathprobe commit.
 #
-# Prints the upstream commit the patch was applied to: the first ancestor
-# whose subject does not start with "pathprobe:".  Every commit of the CI
-# scaffolding on this branch must carry that prefix.  With --base-only, prints
-# the commit and applies nothing.
+# Prints the upstream commit the patch was applied to: the most recent commit
+# that changes anything outside .github/.  The CI scaffolding on this branch
+# lives entirely under .github/, so its commits are skipped whatever their
+# subjects say.  With --base-only, prints the commit and applies nothing.
 set -eu
 
 base_only=false
@@ -22,8 +22,11 @@ fi
 top=$(git rev-parse --show-toplevel)
 cd "$top"
 
-base=$(git log --format='%H %s' | awk '$2 != "pathprobe:" { print $1; exit }')
-if [ -z "$base" ]; then
+base=$(git log -1 --format=%H -- . ':!.github')
+# In a shallow clone the oldest fetched commit looks as if it added the whole
+# tree, so it matches the pathspec even when the real base is deeper.
+shallow="$(git rev-parse --git-dir)/shallow"
+if [ -z "$base" ] || { [ -f "$shallow" ] && grep -qx "$base" "$shallow"; }; then
 	echo "no upstream commit in the fetched history; increase fetch-depth" >&2
 	exit 1
 fi

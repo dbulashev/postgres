@@ -2,8 +2,9 @@
 # with the pathprobe extension installed, pushed to Docker Hub as one
 # multi-platform tag (linux/amd64 + linux/arm64, e.g. Apple Silicon).
 #
-# The branch is master plus CI scaffolding commits whose subjects start with
-# "pathprobe:".  To rebuild against a newer master: rebase pathprobe-image
+# The branch is master plus CI scaffolding commits that touch only .github/;
+# the most recent commit outside .github/ is the upstream base (see
+# apply-patches.sh).  To rebuild against a newer master: rebase pathprobe-image
 # onto master and push.  To take a newer pathprobe: change PATHPROBE_REF
 # below (or pass pathprobe_ref to a manual run).  If the patch stops applying,
 # the "Apply patch" step fails and nothing is pushed.

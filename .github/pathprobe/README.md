@@ -63,9 +63,11 @@ compiled in; on a stock server the extension runs with reduced coverage.
 
 ## Updating
 
-Every CI commit on this branch has a subject starting with `pathprobe:`.
-The workflow treats the first commit without that prefix as the upstream
-base.  To rebuild against a newer master:
+CI commits on this branch touch only `.github/`.  The workflow treats the
+most recent commit that changes anything outside `.github/` as the upstream
+base, so a CI commit must not touch the source tree.  Subjects by convention
+start with `pathprobe:`, but the base does not depend on them.  To rebuild
+against a newer master:
 
 ```sh
 git rebase master pathprobe-image
