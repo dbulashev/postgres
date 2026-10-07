@@ -27,18 +27,22 @@ manually with the `pathprobe_ref` input.
 ### Local pathprobe patches
 
 Changes that are not in the pathprobe repository yet can be built and tested
-here first: put them as `git format-patch` files into `pathprobe-patches/`.
+here first: put them as `git format-patch` files into `local-patches/`.
 `apply-patches.sh` applies them to the pathprobe checkout with `git am`
 before the core hooks patch (they may change it), and the image tag gets a
 `-local<hash>` suffix, a hash of the series.
 
 ```sh
 cd <pathprobe checkout>
-git format-patch <PATHPROBE_REF>..<branch> -o <this repo>/.github/pathprobe/pathprobe-patches/
+git format-patch <PATHPROBE_REF>..<branch> -o <this repo>/.github/pathprobe/local-patches/
 ```
 
 Once the changes are in the pathprobe repository, move `PATHPROBE_REF` to
 that commit and delete the files.
+
+`pathprobe-patches/` is not applied: it keeps the first such series, which
+pathprobe adapted in `r2d2/dmitry-attribution` and links to from its
+acknowledgements.  See `pathprobe-patches/README.md`.
 
 ## Image
 
@@ -65,7 +69,9 @@ SELECT pathprobe_json('SELECT ...')::jsonb;     -- events, summary, coverage
 ```
 
 `coverage.add_path_precheck = true` in the JSON confirms the hooks are
-compiled in; on a stock server the extension runs with reduced coverage.
+compiled in, `coverage.add_path_removed = true` that they come from the
+current core patch; on a stock server the extension runs with reduced
+coverage.
 
 ## CI
 
@@ -73,7 +79,8 @@ compiled in; on a stock server the extension runs with reduced coverage.
   it, `make installcheck` of the extension.  The Perl TAP model tests (`t/`)
   are not run.
 - `build`: image per platform, smoke test (coverage of the core hooks,
-  `listen_addresses = '*'`), push by digest.
+  including `add_path_removed`, and `listen_addresses = '*'`), push by
+  digest.
 - `merge`: one manifest list with the tags above.
 
 ## Updating

@@ -36,12 +36,12 @@ concurrency:
 env:
   PATHPROBE_REPO: obartunov/pathprobe
   # Pinned: the core hooks patch and the extension must come from the same
-  # commit (r2d2/path-graph, a7f1bd7).  The jobs after prepare use the
-  # resolved sha, so a branch passed to a manual run cannot move between
+  # commit (r2d2/dmitry-attribution, 9bcf24c).  The jobs after prepare use
+  # the resolved sha, so a branch passed to a manual run cannot move between
   # them.  Changes not yet in the pathprobe repository go on top as
-  # format-patch files in .github/pathprobe/pathprobe-patches/ (see
+  # format-patch files in .github/pathprobe/local-patches/ (see
   # apply-patches.sh); the image tag then carries a hash of that series.
-  PATHPROBE_REF: ${{ inputs.pathprobe_ref || 'a7f1bd7ccd984f77d25ce4a2882f636db3505d59' }}
+  PATHPROBE_REF: ${{ inputs.pathprobe_ref || '9bcf24c2e52d3ce38070ed37b5fd96adf3de7d2f' }}
 
 jobs:
   prepare:
@@ -78,8 +78,8 @@ jobs:
           echo "pathprobe_short=${pp:0:7}" >> "$GITHUB_OUTPUT"
           # local pathprobe patches: a short hash of the series, empty if none
           local=
-          if ls .github/pathprobe/pathprobe-patches/*.patch >/dev/null 2>&1; then
-            local=$(cat .github/pathprobe/pathprobe-patches/*.patch | sha256sum | cut -c1-7)
+          if ls .github/pathprobe/local-patches/*.patch >/dev/null 2>&1; then
+            local=$(cat .github/pathprobe/local-patches/*.patch | sha256sum | cut -c1-7)
           fi
           echo "local_patches=$local" >> "$GITHUB_OUTPUT"
           echo "tag=$pg-${base:0:12}-pp${pp:0:7}${local:+-local$local}" >> "$GITHUB_OUTPUT"
@@ -203,8 +203,9 @@ jobs:
 
       # A stock server runs the extension too, with reduced coverage, so
       # check coverage rather than just that the functions exist:
-      # add_path_precheck needs the core hooks patch.  The listen_addresses
-      # check guards the published port.
+      # add_path_precheck needs the core hooks patch, add_path_removed its
+      # current version.  The listen_addresses check guards the published
+      # port.
       - name: Smoke test
         run: |
           docker run -d --name pp -e POSTGRES_PASSWORD=postgres pathprobe:ci
@@ -226,6 +227,11 @@ jobs:
           grep -qx '\*' smoke.log || { echo "::error::listen_addresses is not '*'"; exit 1; }
           if ! grep -q '"add_path_precheck": true' smoke.log; then
             echo "::error::no add_path_precheck coverage: core hooks missing (${{ matrix.platform }})"
+            docker logs pp
+            exit 1
+          fi
+          if ! grep -q '"add_path_removed": true' smoke.log; then
+            echo "::error::no add_path_removed coverage: core hooks patch is older than the extension (${{ matrix.platform }})"
             docker logs pp
             exit 1
           fi
